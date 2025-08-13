@@ -483,6 +483,46 @@ async def cmd_gs_test(message: Message):
         await message.answer(f"❌ Ошибка записи в Google Sheets: {e}\n"
                              f"Проверь доступ сервис-аккаунта к таблице и корректность GOOGLE_CREDENTIALS.")
 
+@dp.message(Command("gs_info"))
+async def cmd_gs_info(message: Message):
+    ok = _sheets_ws is not None
+    short = (GOOGLE_CREDENTIALS or "")[:40]
+    await message.answer(
+        "Sheets: {ok}\nWS: {ws}\nSPREADSHEET_ID: {sid}\nCRED startswith: {short}".format(
+            ok="OK" if ok else "NOT INIT",
+            ws=SHEETS_WORKSHEET,
+            sid=SHEETS_SPREADSHEET_ID,
+            short=short.replace("\n", "\\n")
+        )
+    )
+
+@dp.message(Command("gs_test"))
+async def cmd_gs_test(message: Message):
+    if not _sheets_ws:
+        return await message.answer("❌ Sheets не инициализирован. Сначала почини ENV и перезапусти.")
+    try:
+        _sheets_ws.append_row(
+            [datetime.utcnow().isoformat(), str(message.from_user.id), "gs_test", "", "0", "0", "manual", "{}"],
+            value_input_option="RAW"
+        )
+        await message.answer("✅ Записал тестовую строку в Google Sheets.")
+    except Exception:
+        logging.exception("gs_test append failed")
+        await message.answer("❌ Не смог записать в Google Sheets. Смотри логи.")
+
+@dp.message(Command("gs_debug"))
+async def cmd_gs_debug(message: Message):
+    # Печатаем, что видит процесс — без секретов
+    has_env = all([GOOGLE_CREDENTIALS, SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET])
+    msg = [
+        f"ENV OK: {has_env}",
+        f"ID: {SHEETS_SPREADSHEET_ID or '-'}",
+        f"WS: {SHEETS_WORKSHEET or '-'}",
+        f"Cred len: {len(GOOGLE_CREDENTIALS or '')}",
+        f"Sheets inited: {bool(_sheets_ws)}",
+    ]
+    await message.answer("\n".join(msg))
+
 # ============== CALLBACKS ==============
 @dp.callback_query(F.data=="show_tariffs")
 async def cb_show_tariffs(call: CallbackQuery):
