@@ -5,20 +5,22 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 
 import httpx
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import (
-    Message, Update, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
+from aiogram.types import Message, Update, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-# ================== ЛОГИ ==================
+# ---- Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ============== LOGS ==============
 logging.basicConfig(level=logging.INFO)
 
-# ================== ENV ==================
+# ============== ENV ==============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<app>.onrender.com/webhook
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "savol_secret")
@@ -27,23 +29,24 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Live-поиск
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # если нет — фолбек без поиска
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # для live-поиска (по желанию)
 
-# Админ для ручной активации (MVP)
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # например "123456789"
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
 
-# Персистентное хранилище пользователей
+# Персистентные файлы
 USERS_DB_PATH = os.getenv("USERS_DB_PATH", "users_limits.json")
-
-# Файл аналитики (одна строка JSON на событие)
 ANALYTICS_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics_events.jsonl")
+
+# Google Sheets
+SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
+SHEETS_WORKSHEET = os.getenv("SHEETS_WORKSHEET", "Events")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
-# ================== МОДЕРАЦИЯ ==================
+# ============== МОДЕРАЦИЯ ==============
 ILLEGAL_PATTERNS = [
     r"\b(взлом|хак|кейлоггер|фишинг|ботнет|ддос|ddos)\b",
     r"\b(как\s+получить\s+доступ|обойти|взять\s+пароль)\b.*\b(аккаунт|телеграм|инстаграм|банк|почт)\b",
@@ -68,16 +71,12 @@ def violates_policy(text: str) -> bool:
     t = text.lower()
     return any(re.search(rx, t) for rx in ILLEGAL_PATTERNS)
 
-# ================== ТАРИФЫ/ЛИМИТЫ ==================
+# ============== ТАРИФЫ/ЛИМИТЫ ==============
 FREE_LIMIT = 2
 TARIFFS = {
-    "start": {
-        "title": "Старт",
-        "price_uzs": 49_000,
-        "desc": ["До 100 сообщений/мес", "Краткие и понятные ответы", "Без генерации файлов и картинок"],
-        "active": True,
-        "duration_days": 30,
-    },
+    "start": {"title": "Старт", "price_uzs": 49_000,
+              "desc": ["До 100 сообщений/мес", "Краткие и понятные ответы", "Без генерации файлов и картинок"],
+              "active": True, "duration_days": 30},
     "business": {"title": "Бизнес", "price_uzs": 119_000,
                  "desc": ["До 500 сообщений/мес", "Инструкции и чек-листы", "Простые документы (docx/pdf)"],
                  "active": False, "duration_days": 30},
@@ -86,15 +85,14 @@ TARIFFS = {
             "active": False, "duration_days": 30},
 }
 
-# ================== ТЕМЫ ==================
 TOPICS = {
-    "daily":   {"title_ru": "Быт",              "title_uz": "Maishiy",            "hint": "Практичные советы, чек-листы и шаги."},
-    "finance": {"title_ru": "Финансы",          "title_uz": "Moliya",             "hint": "Объясняй с цифрами и примерами. Без рискованных персональных рекомендаций."},
-    "gov":     {"title_ru": "Госуслуги",        "title_uz": "Davlat xizmatlari", "hint": "Опиши процедуру, документы и шаги подачи."},
-    "biz":     {"title_ru": "Бизнес",           "title_uz": "Biznes",             "hint": "Краткие инструкции по регистрации/отчётности/документам."},
-    "edu":     {"title_ru": "Учёба",            "title_uz": "Ta’lim",             "hint": "Расскажи про поступление/обучение и шаги."},
-    "it":      {"title_ru": "IT",               "title_uz": "IT",                 "hint": "Технически и конкретно. Не советуй ничего незаконного."},
-    "health":  {"title_ru": "Здоровье (общ.)",  "title_uz": "Sog‘liq (umumiy)",   "hint": "Только общая информация. Советуй обращаться к врачу."},
+    "daily":   {"title_ru": "Быт", "title_uz": "Maishiy", "hint": "Практичные советы, чек-листы и шаги."},
+    "finance": {"title_ru": "Финансы", "title_uz": "Moliya", "hint": "Объясняй с цифрами и примерами. Без рискованных персональных рекомендаций."},
+    "gov":     {"title_ru": "Госуслуги", "title_uz": "Davlat xizmatlari", "hint": "Опиши процедуру, документы и шаги подачи."},
+    "biz":     {"title_ru": "Бизнес", "title_uz": "Biznes", "hint": "Краткие инструкции по регистрации/отчётности/документам."},
+    "edu":     {"title_ru": "Учёба", "title_uz": "Ta’lim", "hint": "Расскажи про поступление/обучение и шаги."},
+    "it":      {"title_ru": "IT", "title_uz": "IT", "hint": "Технически и конкретно. Не советуй ничего незаконного."},
+    "health":  {"title_ru": "Здоровье (общ.)", "title_uz": "Sog‘liq (umumiy)", "hint": "Только общая информация. Советуй обращаться к врачу."},
 }
 
 def topic_kb(lang="ru", current=None):
@@ -107,8 +105,8 @@ def topic_kb(lang="ru", current=None):
     rows.append([InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="topic:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ================== ПЕРСИСТЕНТНОЕ ХРАНИЛИЩЕ USERS ==================
-# tg_id -> {"free_used": int, "plan": str, "paid_until": dt|None, "lang": "ru"/"uz", "topic": str|None, "live": bool}
+# ============== USERS (персистентно) ==============
+# tg_id -> {...}
 USERS: dict[int, dict] = {}
 
 def _serialize_user(u: dict) -> dict:
@@ -123,30 +121,23 @@ def _serialize_user(u: dict) -> dict:
 
 def save_users():
     try:
-        path = Path(USERS_DB_PATH)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        to_dump = {str(k): _serialize_user(v) for k, v in USERS.items()}
+        path = Path(USERS_DB_PATH); path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as f:
-            json.dump(to_dump, f, ensure_ascii=False, indent=2)
+            json.dump({str(k): _serialize_user(v) for k, v in USERS.items()}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.warning("save_users failed: %s", e)
 
 def load_users():
     global USERS
-    path = Path(USERS_DB_PATH)
-    if not path.exists():
-        USERS = {}
-        return
+    p = Path(USERS_DB_PATH)
+    if not p.exists(): USERS = {}; return
     try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(p.read_text("utf-8"))
         USERS = {}
         for k, v in data.items():
             pu = v.get("paid_until")
-            try:
-                paid_until = datetime.fromisoformat(pu) if pu else None
-            except Exception:
-                paid_until = None
+            try: paid_until = datetime.fromisoformat(pu) if pu else None
+            except Exception: paid_until = None
             USERS[int(k)] = {
                 "free_used": int(v.get("free_used", 0)),
                 "plan": v.get("plan", "free"),
@@ -155,9 +146,8 @@ def load_users():
                 "topic": v.get("topic"),
                 "live": bool(v.get("live", False)),
             }
-        logging.info("Users loaded: %d", len(USERS))
-    except Exception as e:
-        logging.exception("load_users failed: %s")
+    except Exception:
+        logging.exception("load_users failed")
         USERS = {}
 
 def get_user(tg_id: int):
@@ -168,8 +158,8 @@ def get_user(tg_id: int):
         save_users()
     return u
 
-def has_active_sub(user: dict) -> bool:
-    return user["plan"] in ("start", "business", "pro") and user["paid_until"] and user["paid_until"] > datetime.utcnow()
+def has_active_sub(u: dict) -> bool:
+    return u["plan"] in ("start","business","pro") and u["paid_until"] and u["paid_until"] > datetime.utcnow()
 
 def pay_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -190,12 +180,11 @@ def tariffs_text(lang='ru'):
             txt.append(f"⭐ {t['title']} {badge}\nЦена: {t['price_uzs']:,} сум/мес\n{bullet(t['desc'])}")
     return "\n\n".join(txt)
 
-# ================== ИИ ==================
+# ============== ИИ ==============
 BASE_SYSTEM_PROMPT = (
     "Ты — SavolBot, дружелюбный консультант. Отвечай кратко и ясно (до 6–8 предложений). "
     "Соблюдай законы Узбекистана. Не давай инструкции по незаконным действиям, подделкам, взломам, обходу систем. "
-    "По медицине — только общая справка и совет обратиться к врачу. "
-    "Язык ответа = язык вопроса (RU/UZ)."
+    "По медицине — только общая справка и совет обратиться к врачу. Язык ответа = язык вопроса (RU/UZ)."
 )
 
 async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
@@ -211,399 +200,302 @@ async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
 
-# ---- Live-поиск ----
+# ============== LIVE SEARCH ==============
 TIME_SENSITIVE_PATTERNS = [
     r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
     r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
     r"\b(bugun|hozir|narx|kurs|yangilik)\b",
-    r"\b(кто|как зовут|фамилия|председател[ья]?|директор|гендиректор|ceo|chairman|руководител[ья]?)\b",
-    r"\b(банк|акб|ооо|ао|компания|министерств[оа])\b.*",
+    r"\b(кто|как зовут|председател|директор|ceo|руководител)\b",
 ]
 def is_time_sensitive(q: str) -> bool:
-    t = q.lower()
-    return any(re.search(rx, t) for rx in TIME_SENSITIVE_PATTERNS)
+    return any(re.search(rx, q.lower()) for rx in TIME_SENSITIVE_PATTERNS)
 
-# ====== КЭШ ДЛЯ LIVE-ПОИСКА ======
-CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))  # 24 часа
+CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
 CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
-LIVE_CACHE: dict[str, dict] = {}  # key -> {"ts": float, "answer": str}
+LIVE_CACHE: dict[str, dict] = {}
 
-def _norm_query(q: str) -> str:
-    return re.sub(r"\s+", " ", q.strip().lower())
-
-def cache_get(q: str) -> str | None:
-    k = _norm_query(q)
-    item = LIVE_CACHE.get(k)
-    if not item:
-        return None
-    if time.time() - item["ts"] > CACHE_TTL_SECONDS:
-        LIVE_CACHE.pop(k, None)
-        return None
-    return item["answer"]
-
-def cache_set(q: str, answer: str):
-    if len(LIVE_CACHE) >= CACHE_MAX_ENTRIES:
-        oldest_key = min(LIVE_CACHE, key=lambda kk: LIVE_CACHE[kk]["ts"])
-        LIVE_CACHE.pop(oldest_key, None)
-    LIVE_CACHE[_norm_query(q)] = {"ts": time.time(), "answer": answer}
+def _norm_query(q: str) -> str: return re.sub(r"\s+", " ", q.strip().lower())
+def cache_get(q: str): 
+    k=_norm_query(q); it=LIVE_CACHE.get(k)
+    if not it: return None
+    if time.time()-it["ts"]>CACHE_TTL_SECONDS: LIVE_CACHE.pop(k,None); return None
+    return it["answer"]
+def cache_set(q: str, a: str):
+    if len(LIVE_CACHE)>=CACHE_MAX_ENTRIES:
+        oldest=min(LIVE_CACHE,key=lambda x:LIVE_CACHE[x]["ts"]); LIVE_CACHE.pop(oldest,None)
+    LIVE_CACHE[_norm_query(q)]={"ts":time.time(),"answer":a}
 
 async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
-    if not TAVILY_API_KEY:
-        return None
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": "advanced",
-        "max_results": max_results,
-        "include_answer": True,
-        "include_domains": [],
-    }
+    if not TAVILY_API_KEY: return None
+    payload={"api_key":TAVILY_API_KEY,"query":query,"search_depth":"advanced","max_results":max_results,
+             "include_answer":True,"include_domains":[]}
     async with httpx.AsyncClient(timeout=25.0) as client:
-        r = await client.post("https://api.tavily.com/search", json=payload)
-        r.raise_for_status()
-        return r.json()
+        r=await client.post("https://api.tavily.com/search", json=payload); r.raise_for_status(); return r.json()
 
 async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str:
-    cached = cache_get(user_text)
-    if cached:
-        return cached + "\n\n(из кэша за последние 24 часа)"
-
-    data = await web_search_tavily(user_text)
-    if not data:
-        return await ask_gpt(user_text, topic_hint)
-
-    snippets, sources_for_user = [], []
-    for item in (data.get("results") or [])[:5]:
-        title = (item.get("title") or "")[:120]
-        url = item.get("url") or ""
-        content = (item.get("content") or "")[:500]
+    c=cache_get(user_text)
+    if c: return c+"\n\n(из кэша за последние 24 часа)"
+    data=await web_search_tavily(user_text)
+    if not data: return await ask_gpt(user_text, topic_hint)
+    snippets=[]; sources=[]
+    for it in (data.get("results") or [])[:5]:
+        title=(it.get("title") or "")[:120]; url=it.get("url") or ""; content=(it.get("content") or "")[:500]
         snippets.append(f"- {title}\n{content}\nИсточник: {url}")
-        sources_for_user.append(f"• {title} — {url}")
-
-    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на предоставленные источники. Кратко, по делу."
-    if topic_hint:
-        system += f" Учитывай контекст темы: {topic_hint}"
-    user_augmented = f"{user_text}\n\nИСТОЧНИКИ:\n" + "\n\n".join(snippets)
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {"model": OPENAI_MODEL, "temperature": 0.4,
-               "messages": [{"role": "system", "content": system},
-                            {"role": "user", "content": user_augmented}]}
+        sources.append(f"• {title} — {url}")
+    system=BASE_SYSTEM_PROMPT+" Отвечай, опираясь на источники. Кратко, по делу."
+    if topic_hint: system+=f" Учитывай контекст темы: {topic_hint}"
+    user_aug=f"{user_text}\n\nИСТОЧНИКИ:\n"+"\n\n".join(snippets)
+    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload={"model":OPENAI_MODEL,"temperature":0.4,
+             "messages":[{"role":"system","content":system},{"role":"user","content":user_aug}]}
     async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
-        r = await client.post("/chat/completions", headers=headers, json=payload)
-        r.raise_for_status()
-        answer = r.json()["choices"][0]["message"]["content"].strip()
+        r=await client.post("/chat/completions", headers=headers, json=payload); r.raise_for_status()
+        answer=r.json()["choices"][0]["message"]["content"].strip()
+    final=answer+"\n\nИсточники:\n"+"\n".join(sources)
+    cache_set(user_text, final); return final
 
-    tail = "\n\nИсточники:\n" + "\n".join(sources_for_user)
-    final_answer = answer + tail
+# ============== АНАЛИТИКА: FILE + SHEETS ==============
+_sheets_client = None
+_sheets_ws = None
 
-    cache_set(user_text, final_answer)
-    return final_answer
+def _ts() -> str: return datetime.utcnow().isoformat()
 
-# ================== АНАЛИТИКА ==================
-def _ts() -> str:
-    return datetime.utcnow().isoformat()
+def _init_sheets():
+    global _sheets_client, _sheets_ws
+    if not (GOOGLE_SERVICE_ACCOUNT_JSON and SHEETS_SPREADSHEET_ID):
+        logging.info("Sheets: env not set; skip")
+        return
+    try:
+        creds_info=json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        creds=Credentials.from_service_account_info(creds_info, scopes=scopes)
+        _sheets_client=gspread.authorize(creds)
+        sh=_sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        try:
+            _sheets_ws=sh.worksheet(SHEETS_WORKSHEET)
+        except gspread.WorksheetNotFound:
+            _sheets_ws=sh.add_worksheet(title=SHEETS_WORKSHEET, rows=2000, cols=20)
+            _sheets_ws.append_row(
+                ["ts","user_id","event","topic","live","time_sensitive","mode","extra"],
+                value_input_option="RAW"
+            )
+        logging.info("Sheets connected to %s/%s", SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET)
+    except Exception:
+        logging.exception("Sheets init failed")
+        _sheets_client=_sheets_ws=None
+
+def _sheets_append(row: dict):
+    if not _sheets_ws: return
+    try:
+        _sheets_ws.append_row(
+            [
+                row.get("ts",""),
+                str(row.get("user_id","")),
+                row.get("event",""),
+                str(row.get("topic","")),
+                "1" if row.get("live") else "0",
+                "1" if row.get("time_sensitive") else "0",
+                row.get("mode",""),
+                json.dumps({k:v for k,v in row.items() if k not in {"ts","user_id","event","topic","live","time_sensitive","mode"}}, ensure_ascii=False)
+            ],
+            value_input_option="RAW"
+        )
+    except Exception as e:
+        logging.warning("Sheets append failed: %s", e)
 
 def log_event(user_id: int, name: str, **payload):
+    row={"ts":_ts(), "user_id":user_id, "event":name, **payload}
+    # файл JSONL
     try:
-        path = Path(ANALYTICS_DB_PATH)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        row = {"ts": _ts(), "user_id": user_id, "event": name, **payload}
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        p=Path(ANALYTICS_DB_PATH); p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False)+"\n")
     except Exception as e:
-        logging.warning("log_event failed: %s", e)
-
-def load_events(days: int | None = None):
-    path = Path(ANALYTICS_DB_PATH)
-    if not path.exists():
-        return []
-    cutoff = None
-    if days is not None:
-        cutoff = datetime.utcnow() - timedelta(days=days)
-    out = []
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    ev = json.loads(line)
-                    if cutoff:
-                        ts = datetime.fromisoformat(ev.get("ts","").split("+")[0])
-                        if ts < cutoff:
-                            continue
-                    out.append(ev)
-                except Exception:
-                    continue
-    except Exception as e:
-        logging.warning("load_events failed: %s", e)
-    return out
+        logging.warning("log_event file failed: %s", e)
+    # Google Sheets
+    _sheets_append(row)
 
 def format_stats(days: int | None = 7):
-    evs = load_events(days)
-    total = len(evs)
-    users = {e["user_id"] for e in evs}
-    per_event = Counter(e["event"] for e in evs)
-    # вопросы:
-    q = [e for e in evs if e["event"] == "question"]
-    topics = Counter((e.get("topic") or "—") for e in q)
-    live_used = sum(1 for e in q if e.get("live"))
-    time_sens = sum(1 for e in q if e.get("time_sensitive"))
-    # подписки:
-    grants = [e for e in evs if e["event"] == "subscription_granted"]
-    paid_clicks = [e for e in evs if e["event"] == "paid_done_click"]
-
-    active_subs_now = sum(1 for u in USERS.values() if u["plan"] != "free" and has_active_sub(u))
-
-    lines = []
-    period = f"за последние {days} дн." if days else "за всё время"
-    lines.append(f"📊 Статистика {period}")
-    lines.append(f"• Событий: {total} | Уник. пользователей: {len(users)}")
-    lines.append(f"• Вопросов: {len(q)} (Live: {live_used}, срочные: {time_sens})")
-    if topics:
-        top = ", ".join(f"{k}:{v}" for k, v in topics.most_common(6))
-        lines.append(f"• Тематики (топ): {top}")
-    lines.append(f"• Кнопка «Оплатил»: {len(paid_clicks)} | Активаций подписки: {len(grants)}")
-    lines.append(f"• Активных подписок сейчас: {active_subs_now}")
+    # лёгкая сводка по файлу (Sheets для просмотра в UI)
+    p=Path(ANALYTICS_DB_PATH)
+    if not p.exists(): return "Пока нет событий."
+    cutoff = datetime.utcnow()-timedelta(days=days) if days else None
+    evs=[]
+    for line in p.read_text("utf-8").splitlines():
+        try:
+            e=json.loads(line)
+            if cutoff:
+                ts=datetime.fromisoformat(e.get("ts","").split("+")[0])
+                if ts<cutoff: continue
+            evs.append(e)
+        except Exception:
+            continue
+    total=len(evs); users=len({e["user_id"] for e in evs})
+    per=Counter(e["event"] for e in evs)
+    qs=[e for e in evs if e["event"]=="question"]
+    topics=Counter((e.get("topic") or "—") for e in qs)
+    grants=sum(1 for e in evs if e["event"]=="subscription_granted")
+    paid_clicks=sum(1 for e in evs if e["event"]=="paid_done_click")
+    active_now=sum(1 for u in USERS.values() if has_active_sub(u))
+    lines=[
+        f"📊 Статистика за {days} дн.",
+        f"• Событий: {total} | Уник. пользователей: {users}",
+        f"• Вопросов: {len(qs)} | Live-использований: {sum(1 for e in qs if e.get('live'))}",
+        f"• Топ тем: "+", ".join(f"{k}:{v}" for k,v in topics.most_common(6)) if topics else "• Топ тем: —",
+        f"• Кнопка «Оплатил»: {paid_clicks} | Активаций подписки: {grants}",
+        f"• Активных подписок сейчас: {active_now}"
+    ]
     return "\n".join(lines)
 
-# ================== КОМАНДЫ ==================
+# ============== КОМАНДЫ ==============
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    u = get_user(message.from_user.id)
-    u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"
-    save_users()
-    log_event(message.from_user.id, "start", lang=u["lang"])
+    u=get_user(message.from_user.id)
+    u["lang"]="uz" if is_uzbek(message.text or "") else "ru"; save_users()
+    log_event(message.from_user.id,"start",lang=u["lang"])
     await message.answer(
         "👋 Привет! / Assalomu alaykum!\n"
         "Первые 2 ответа — бесплатно, дальше подписка «Старт».\n"
-        "Задайте вопрос или выберите тему: /topics\n"
+        "Выберите тему: /topics\n"
         "Для свежих данных включите live-поиск: /live_on"
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    log_event(message.from_user.id, "help")
+    log_event(message.from_user.id,"help")
     await message.answer(
-        "ℹ️ Как пользоваться:\n"
-        "1) Пишите вопрос (RU/UZ). Язык ответа = язык вопроса.\n"
-        "2) /topics — выберите тему для более точных ответов.\n"
-        "3) Первые 2 ответа — бесплатно; дальше /tariffs.\n"
-        "4) /live_on — включить интернет-поиск; /live_off — выключить.\n"
-        "5) /asklive вопрос — разовый live-поиск."
+        "ℹ️ Пишите вопрос (RU/UZ). /topics — выбор темы. /live_on — включить интернет-поиск.\n"
+        "Первые 2 ответа — бесплатно; дальше /tariffs."
     )
 
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
-    log_event(message.from_user.id, "about")
-    await message.answer(
-        "🤖 SavolBot — проект TripleA. Ответы на базе GPT, строго в рамках закона РУз.\n"
-        "Поддержать проект и снять лимиты — /tariffs."
-    )
+    log_event(message.from_user.id,"about")
+    await message.answer("🤖 SavolBot от TripleA. В рамках закона РУз. Поддержать проект — /tariffs.")
 
-@dp.message(Command("tariffs"))
+@dp.message(Command("tariffs")))
 async def cmd_tariffs(message: Message):
-    u = get_user(message.from_user.id)
-    log_event(message.from_user.id, "view_tariffs")
+    u=get_user(message.from_user.id); log_event(message.from_user.id,"view_tariffs")
     await message.answer(tariffs_text(u["lang"]), reply_markup=pay_kb())
 
 @dp.message(Command("myplan"))
 async def cmd_myplan(message: Message):
-    u = get_user(message.from_user.id)
-    status = "активна" if has_active_sub(u) else "нет"
-    until = u["paid_until"].isoformat() if u["paid_until"] else "—"
-    topic = u.get("topic") or "—"
-    live = "вкл" if u.get("live") else "выкл"
-    log_event(message.from_user.id, "myplan_open")
-    await message.answer(
-        f"Ваш план: {u['plan']} | Live-поиск: {live}\nПодписка: {status} (до {until})\n"
-        f"Тема: {topic}\nБесплатных использовано: {u['free_used']}/{FREE_LIMIT}"
-    )
+    u=get_user(message.from_user.id)
+    status="активна" if has_active_sub(u) else "нет"
+    until=u["paid_until"].isoformat() if u["paid_until"] else "—"
+    topic=u.get("topic") or "—"; live="вкл" if u.get("live") else "выкл"
+    log_event(message.from_user.id,"myplan_open")
+    await message.answer(f"Ваш план: {u['plan']} | Live: {live}\nПодписка: {status} (до {until})\nТема: {topic}\nБесплатно: {u['free_used']}/{FREE_LIMIT}")
 
 @dp.message(Command("topics"))
 async def cmd_topics(message: Message):
-    u = get_user(message.from_user.id)
-    lang = u["lang"]
-    log_event(message.from_user.id, "topics_open")
-    head = "🗂 Выберите тему (не влияет на цену, только на стиль ответа):" if lang == "ru" \
-        else "🗂 Mavzuni tanlang (narxga ta’sir qilmaydi, faqat javob ohangiga):"
+    u=get_user(message.from_user.id); lang=u["lang"]; log_event(message.from_user.id,"topics_open")
+    head="🗂 Выберите тему:" if lang=="ru" else "🗂 Mavzuni tanlang:"
     await message.answer(head, reply_markup=topic_kb(lang, current=u.get("topic")))
 
 @dp.message(Command("asklive"))
 async def cmd_asklive(message: Message):
-    u = get_user(message.from_user.id)
-    q = message.text.replace("/asklive", "", 1).strip()
-    if not q:
-        return await message.answer("Напишите так: /asklive ваш вопрос")
-    if not has_active_sub(u) and u["free_used"] >= FREE_LIMIT:
-        return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
-    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint") if u.get("topic") else None
+    u=get_user(message.from_user.id); q=message.text.replace("/asklive","",1).strip()
+    if not q: return await message.answer("Напишите так: /asklive ваш вопрос")
+    if not has_active_sub(u) and u["free_used"]>=FREE_LIMIT:
+        log_event(message.from_user.id,"paywall_shown"); return await message.answer("💳 Доступ ограничен. Оформите подписку:", reply_markup=pay_kb())
+    topic_hint = TOPICS.get(u.get("topic"),{}).get("hint")
     try:
-        reply = await answer_with_live_search(q, topic_hint)
-        await message.answer(reply)
-        log_event(message.from_user.id, "question", mode="asklive", topic=u.get("topic"), live=True, time_sensitive=True)
-    except Exception as e:
-        logging.exception("Live error: %s", e)
-        return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
-    if not has_active_sub(u):
-        u["free_used"] += 1
-        save_users()
+        reply=await answer_with_live_search(q, topic_hint); await message.answer(reply)
+        log_event(message.from_user.id,"question",mode="asklive",topic=u.get("topic"),live=True,time_sensitive=True)
+    except Exception:
+        logging.exception("Live error"); return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
+    if not has_active_sub(u): u["free_used"]+=1; save_users()
 
 @dp.message(Command("live_on"))
 async def cmd_live_on(message: Message):
-    u = get_user(message.from_user.id)
-    u["live"] = True
-    save_users()
-    log_event(message.from_user.id, "live_on")
-    await message.answer("✅ Live-поиск включён. Все ваши вопросы будут проверяться по интернет-источникам.")
+    u=get_user(message.from_user.id); u["live"]=True; save_users(); log_event(message.from_user.id,"live_on")
+    await message.answer("✅ Live-поиск включён.")
 
 @dp.message(Command("live_off"))
 async def cmd_live_off(message: Message):
-    u = get_user(message.from_user.id)
-    u["live"] = False
-    save_users()
-    log_event(message.from_user.id, "live_off")
-    await message.answer("⏹ Live-поиск выключён. Вернулись к обычным ответам модели.")
+    u=get_user(message.from_user.id); u["live"]=False; save_users(); log_event(message.from_user.id,"live_off")
+    await message.answer("⏹ Live-поиск выключён.")
 
-# ---- cache utils ----
-@dp.message(Command("cache_info"))
-async def cmd_cache_info(message: Message):
-    size = len(LIVE_CACHE)
-    ttl_h = round(CACHE_TTL_SECONDS / 3600, 1)
-    await message.answer(f"🗄 Кэш live-поиска: {size} записей, TTL ≈ {ttl_h} ч., max {CACHE_MAX_ENTRIES}")
-
-@dp.message(Command("cache_clear"))
-async def cmd_cache_clear(message: Message):
-    if ADMIN_CHAT_ID and str(message.from_user.id) != str(ADMIN_CHAT_ID):
-        return await message.answer("Команда доступна администратору.")
-    LIVE_CACHE.clear()
-    await message.answer("🧹 Кэш live-поиска очищен.")
-
-# ---- admin stats ----
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    # /stats [дней]  (по умолчанию 7)
-    if ADMIN_CHAT_ID and str(message.from_user.id) != str(ADMIN_CHAT_ID):
+    if ADMIN_CHAT_ID and str(message.from_user.id)!=str(ADMIN_CHAT_ID):
         return await message.answer("Команда доступна администратору.")
-    parts = message.text.strip().split()
-    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
-    text = format_stats(days)
-    await message.answer(text)
+    parts=message.text.strip().split()
+    days=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else 7
+    await message.answer(format_stats(days))
 
-# ================== CALLBACKS ==================
-@dp.callback_query(F.data == "show_tariffs")
+# ============== CALLBACKS ==============
+@dp.callback_query(F.data=="show_tariffs")
 async def cb_show_tariffs(call: CallbackQuery):
-    u = get_user(call.from_user.id)
-    log_event(call.from_user.id, "view_tariffs_click")
-    await call.message.edit_text(tariffs_text(u["lang"]), reply_markup=pay_kb())
-    await call.answer()
+    u=get_user(call.from_user.id); log_event(call.from_user.id,"view_tariffs_click")
+    await call.message.edit_text(tariffs_text(u["lang"]), reply_markup=pay_kb()); await call.answer()
 
-@dp.callback_query(F.data == "subscribe_start")
+@dp.callback_query(F.data=="subscribe_start")
 async def cb_subscribe_start(call: CallbackQuery):
-    log_event(call.from_user.id, "subscribe_start_open")
-    pay_link = "https://pay.example.com/savolbot/start"  # заглушка
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Готово (я оплатил)", callback_data="paid_start_done")]
-    ])
-    await call.message.answer(
-        f"💳 «Старт» — {TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}", reply_markup=kb
-    )
+    log_event(call.from_user.id,"subscribe_start_open")
+    pay_link="https://pay.example.com/savolbot/start"  # заглушка
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Готово (я оплатил)", callback_data="paid_start_done")]])
+    await call.message.answer(f"💳 «Старт» — {TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}", reply_markup=kb)
     await call.answer()
 
-@dp.callback_query(F.data == "paid_start_done")
+@dp.callback_query(F.data=="paid_start_done")
 async def cb_paid_done(call: CallbackQuery):
-    log_event(call.from_user.id, "paid_done_click")
+    log_event(call.from_user.id,"paid_done_click")
     if ADMIN_CHAT_ID:
-        await bot.send_message(
-            int(ADMIN_CHAT_ID),
+        await bot.send_message(int(ADMIN_CHAT_ID),
             f"👤 @{call.from_user.username or call.from_user.id} запросил активацию «Старт».\n"
-            f"TG ID: {call.from_user.id}\n"
-            f"Используйте /grant_start {call.from_user.id}"
-        )
-    await call.message.answer("Спасибо! Мы проверим оплату и активируем подписку.")
-    await call.answer()
+            f"TG ID: {call.from_user.id}\nИспользуйте /grant_start {call.from_user.id}")
+    await call.message.answer("Спасибо! Мы проверим оплату и активируем подписку."); await call.answer()
 
 @dp.callback_query(F.data.startswith("topic:"))
 async def cb_topic(call: CallbackQuery):
-    u = get_user(call.from_user.id)
-    _, key = call.data.split(":", 1)
-    if key == "close":
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
+    u=get_user(call.from_user.id); _, key = call.data.split(":",1)
+    if key=="close":
+        try: await call.message.delete()
+        except Exception: pass
         return await call.answer("OK")
     if key in TOPICS:
-        u["topic"] = key
-        save_users()
-        lang = u["lang"]
-        title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
-        log_event(call.from_user.id, "topic_select", topic=key)
+        u["topic"]=key; save_users()
+        lang=u["lang"]; title=TOPICS[key]["title_uz"] if lang=="uz" else TOPICS[key]["title_ru"]
+        log_event(call.from_user.id,"topic_select",topic=key)
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
-        await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
+        await call.answer(f"Выбрана тема: {title}" if lang=="ru" else f"Mavzu tanlandi: {title}")
 
-# Админ: ручная активация (MVP)
 @dp.message(Command("grant_start"))
 async def cmd_grant_start(message: Message):
-    if str(message.from_user.id) != str(ADMIN_CHAT_ID):
-        return await message.answer("Команда недоступна.")
-    parts = message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await message.answer("Использование: /grant_start <tg_id>")
-    target_id = int(parts[1])
-    u = get_user(target_id)
-    u["plan"] = "start"
-    u["paid_until"] = datetime.utcnow() + timedelta(days=TARIFFS["start"]["duration_days"])
-    save_users()
-    log_event(message.from_user.id, "subscription_granted", target=target_id, plan="start", paid_until=u["paid_until"].isoformat())
+    if str(message.from_user.id)!=str(ADMIN_CHAT_ID): return await message.answer("Команда недоступна.")
+    parts=message.text.strip().split()
+    if len(parts)!=2 or not parts[1].isdigit(): return await message.answer("Использование: /grant_start <tg_id>")
+    target_id=int(parts[1]); u=get_user(target_id)
+    u["plan"]="start"; u["paid_until"]=datetime.utcnow()+timedelta(days=TARIFFS["start"]["duration_days"]); save_users()
+    log_event(message.from_user.id,"subscription_granted",target=target_id,plan="start",paid_until=u["paid_until"].isoformat())
     await message.answer(f"✅ Активирован «Старт» для {target_id} до {u['paid_until'].isoformat()}")
-    try:
-        await bot.send_message(target_id, "✅ Подписка «Старт» активирована. Приятного использования!")
-    except Exception as e:
-        logging.warning("Notify user failed: %s", e)
+    try: await bot.send_message(target_id,"✅ Подписка «Старт» активирована. Приятного использования!")
+    except Exception: logging.warning("Notify user failed")
 
-# ================== ОБРАБОТЧИК ВОПРОСОВ ==================
+# ============== ОБРАБОТЧИК ВОПРОСОВ ==============
 @dp.message(F.text)
 async def handle_text(message: Message):
-    text = message.text.strip()
-    u = get_user(message.from_user.id)
-
-    # язык
-    if is_uzbek(text):
-        u["lang"] = "uz"
-        save_users()
-
-    # модерация
+    text=message.text.strip(); u=get_user(message.from_user.id)
+    if is_uzbek(text): u["lang"]="uz"; save_users()
     if violates_policy(text):
-        log_event(message.from_user.id, "question_blocked", reason="policy")
-        return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
-
-    # лимиты
-    if not has_active_sub(u) and u["free_used"] >= FREE_LIMIT:
-        log_event(message.from_user.id, "paywall_shown")
+        log_event(message.from_user.id,"question_blocked",reason="policy")
+        return await message.answer(DENY_TEXT_UZ if u["lang"]=="uz" else DENY_TEXT_RU)
+    if not has_active_sub(u) and u["free_used"]>=FREE_LIMIT:
+        log_event(message.from_user.id,"paywall_shown")
         return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
-
-    # тема → подсказка
-    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint") if u.get("topic") else None
-    time_sens = is_time_sensitive(text)
-    use_live = u.get("live") or time_sens
-
-    # ответ
+    topic_hint = TOPICS.get(u.get("topic"),{}).get("hint")
+    time_sens=is_time_sensitive(text); use_live = u.get("live") or time_sens
     try:
-        if use_live:
-            reply = await answer_with_live_search(text, topic_hint)
-        else:
-            reply = await ask_gpt(text, topic_hint)
+        reply = await (answer_with_live_search(text, topic_hint) if use_live else ask_gpt(text, topic_hint))
         await message.answer(reply)
-        log_event(message.from_user.id, "question", topic=u.get("topic"), live=use_live, time_sensitive=time_sens)
-    except Exception as e:
-        logging.exception("OpenAI error: %s", e)
-        return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
+        log_event(message.from_user.id,"question",topic=u.get("topic"),live=use_live,time_sensitive=time_sens)
+    except Exception:
+        logging.exception("OpenAI error"); return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
+    if not has_active_sub(u): u["free_used"]+=1; save_users()
 
-    if not has_active_sub(u):
-        u["free_used"] += 1
-        save_users()
-
-# ================== WEBHOOK ==================
+# ============== WEBHOOK/STARTUP ==============
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
@@ -614,19 +506,15 @@ async def telegram_webhook(request: Request):
 
 @app.on_event("startup")
 async def on_startup():
-    # Загружаем пользователей с диска
     load_users()
-    logging.info("Users DB path: %s", USERS_DB_PATH)
-    logging.info("Analytics path: %s", ANALYTICS_DB_PATH)
-
+    logging.info("Users DB: %s", USERS_DB_PATH)
+    logging.info("Analytics file: %s", ANALYTICS_DB_PATH)
+    _init_sheets()  # подключаем Google Sheets
     if TELEGRAM_TOKEN and WEBHOOK_URL:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-                json={"url": WEBHOOK_URL, "secret_token": WEBHOOK_SECRET}
-            )
+            resp=await client.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+                                   json={"url": WEBHOOK_URL, "secret_token": WEBHOOK_SECRET})
             logging.info("setWebhook: %s %s", resp.status_code, resp.text)
 
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health(): return {"status": "ok"}
