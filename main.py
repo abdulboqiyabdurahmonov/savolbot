@@ -47,7 +47,7 @@ GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_SERVIC
 
 # Whitelist (безлимит для указанных юзеров)
 WHITELIST_USERS = set(
-    int(x) for x in os.getenv("WHITELIST_USERS", "557891018").split(",") if x.strip().isdigit()
+    int(x) for x in os.getenv("WHITELIST_USERS", "557891018", "1942344627").split(",") if x.strip().isdigit()
 )
 
 def is_whitelisted(tg_id: int) -> bool:
