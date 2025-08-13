@@ -268,20 +268,18 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str
     cache_set(user_text, final); return final
 
 # ============== АНАЛИТИКА: FILE + SHEETS ==============
-_sheets_client = None
-_sheets_ws = None
+_sheets_client: gspread.Client | None = None
+_sheets_ws: gspread.Worksheet | None = None
 
-def _ts() -> str: return datetime.utcnow().isoformat()
-
-_sheets_client = None
-_sheets_ws = None
+def _ts() -> str:
+    return datetime.utcnow().isoformat()
 
 def _init_sheets():
     """
     Жёсткая инициализация Google Sheets:
-    - добавлены drive-скоупы (на случай странных прав)
-    - логируем список листов
-    - если нужного листа нет — создаём
+    - добавлен Drive-скоуп (иногда нужен для записи/создания листов)
+    - логируем email сервис-аккаунта и список листов
+    - если нужного листа нет — создаём и добавляем заголовок
     """
     global _sheets_client, _sheets_ws
 
@@ -290,97 +288,132 @@ def _init_sheets():
         return
 
     try:
-        creds_info = json.loads(GOOGLE_CREDENTIALS)
+        # поддержка как plain JSON, так и случайно вставленного base64
+        raw = GOOGLE_CREDENTIALS.strip()
+        try:
+            import base64
+            creds_text = base64.b64decode(raw).decode("utf-8") if not raw.lstrip().startswith("{") else raw
+        except Exception:
+            creds_text = raw
+
+        creds_info = json.loads(creds_text)
+        svc_email = creds_info.get("client_email", "<unknown>")
+
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"  # добавили на всякий
+            "https://www.googleapis.com/auth/drive",
         ]
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         _sheets_client = gspread.authorize(creds)
 
         sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
 
-        # Логируем доступные листы
+        # Лог: какой сервисный аккаунт и какие листы видим
         try:
             ws_titles = [ws.title for ws in sh.worksheets()]
-            logging.info("Sheets worksheets: %s", ws_titles)
+            logging.info("Sheets svc=%s worksheets=%s", svc_email, ws_titles)
         except Exception:
             logging.exception("Failed to list worksheets")
 
-        # Пробуем получить нужный лист
+        # Берём нужный лист или создаём его с заголовком
         try:
             _sheets_ws = sh.worksheet(SHEETS_WORKSHEET)
         except gspread.WorksheetNotFound:
             logging.warning("Worksheet '%s' not found, creating…", SHEETS_WORKSHEET)
             _sheets_ws = sh.add_worksheet(title=SHEETS_WORKSHEET, rows=2000, cols=20)
             _sheets_ws.append_row(
-                ["ts","user_id","event","topic","live","time_sensitive","mode","extra"],
+                ["ts", "user_id", "event", "topic", "live", "time_sensitive", "mode", "extra"],
                 value_input_option="RAW"
             )
 
         logging.info("Sheets OK: spreadsheet=%s worksheet=%s", SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET)
+
     except Exception:
         logging.exception("Sheets init failed")
         _sheets_client = _sheets_ws = None
 
 def _sheets_append(row: dict):
-    if not _sheets_ws: return
+    """Безопасно пишем строку в Google Sheets (если инициализировалось)."""
+    if not _sheets_ws:
+        return
     try:
         _sheets_ws.append_row(
             [
-                row.get("ts",""),
-                str(row.get("user_id","")),
-                row.get("event",""),
-                str(row.get("topic","")),
+                row.get("ts", ""),
+                str(row.get("user_id", "")),
+                row.get("event", ""),
+                str(row.get("topic", "")),
                 "1" if row.get("live") else "0",
                 "1" if row.get("time_sensitive") else "0",
-                row.get("mode",""),
-                json.dumps({k:v for k,v in row.items() if k not in {"ts","user_id","event","topic","live","time_sensitive","mode"}}, ensure_ascii=False)
+                row.get("mode", ""),
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in row.items()
+                        if k not in {"ts", "user_id", "event", "topic", "live", "time_sensitive", "mode"}
+                    },
+                    ensure_ascii=False,
+                ),
             ],
-            value_input_option="RAW"
+            value_input_option="RAW",
         )
     except Exception as e:
         logging.warning("Sheets append failed: %s", e)
 
 def log_event(user_id: int, name: str, **payload):
-    row={"ts":_ts(), "user_id":user_id, "event":name, **payload}
-    # файл JSONL
+    """Пишем событие в локальный JSONL и (если доступен) в Google Sheets."""
+    row = {"ts": _ts(), "user_id": user_id, "event": name, **payload}
+
+    # файл JSONL (локальная телеметрия)
     try:
-        p=Path(ANALYTICS_DB_PATH); p.parent.mkdir(parents=True, exist_ok=True)
+        p = Path(ANALYTICS_DB_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False)+"\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception as e:
         logging.warning("log_event file failed: %s", e)
-    # Google Sheets
+
+    # Google Sheets (если подключено)
     _sheets_append(row)
 
 def format_stats(days: int | None = 7):
-    p=Path(ANALYTICS_DB_PATH)
-    if not p.exists(): return "Пока нет событий."
-    cutoff = datetime.utcnow()-timedelta(days=days) if days else None
-    evs=[]
+    """Короткая сводка по локальному файлу аналитики."""
+    p = Path(ANALYTICS_DB_PATH)
+    if not p.exists():
+        return "Пока нет событий."
+
+    cutoff = datetime.utcnow() - timedelta(days=days) if days else None
+    evs = []
     for line in p.read_text("utf-8").splitlines():
         try:
-            e=json.loads(line)
+            e = json.loads(line)
             if cutoff:
-                ts=datetime.fromisoformat(e.get("ts","").split("+")[0])
-                if ts<cutoff: continue
+                try:
+                    ts = datetime.fromisoformat((e.get("ts", "") or "").split("+")[0])
+                    if ts < cutoff:
+                        continue
+                except Exception:
+                    pass
             evs.append(e)
         except Exception:
             continue
-    total=len(evs); users=len({e["user_id"] for e in evs})
-    qs=[e for e in evs if e["event"]=="question"]
-    topics=Counter((e.get("topic") or "—") for e in qs)
-    grants=sum(1 for e in evs if e["event"]=="subscription_granted")
-    paid_clicks=sum(1 for e in evs if e["event"]=="paid_done_click")
-    active_now=sum(1 for u in USERS.values() if has_active_sub(u))
-    lines=[
+
+    total = len(evs)
+    users = len({e.get("user_id") for e in evs if "user_id" in e})
+    per_event = Counter(e.get("event") for e in evs)
+    qs = [e for e in evs if e.get("event") == "question"]
+    topics = Counter((e.get("topic") or "—") for e in qs)
+    grants = sum(1 for e in evs if e.get("event") == "subscription_granted")
+    paid_clicks = sum(1 for e in evs if e.get("event") == "paid_done_click")
+    active_now = sum(1 for u in USERS.values() if has_active_sub(u))
+
+    lines = [
         f"📊 Статистика за {days} дн.",
         f"• Событий: {total} | Уник. пользователей: {users}",
         f"• Вопросов: {len(qs)} | Live-использований: {sum(1 for e in qs if e.get('live'))}",
-        f"• Топ тем: "+(", ".join(f"{k}:{v}" for k,v in topics.most_common(6)) if topics else "—"),
+        f"• Топ тем: " + (", ".join(f"{k}:{v}" for k, v in topics.most_common(6)) if topics else "—"),
         f"• Кнопка «Оплатил»: {paid_clicks} | Активаций подписки: {grants}",
-        f"• Активных подписок сейчас: {active_now}"
+        f"• Активных подписок сейчас: {active_now}",
     ]
     return "\n".join(lines)
 
