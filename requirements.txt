@@ -6,3 +6,4 @@ duckduckgo-search
 fastapi
 uvicorn
 httpx~=0.24.0
+aiogram==3.12.0
