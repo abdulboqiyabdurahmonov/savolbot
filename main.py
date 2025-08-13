@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from datetime import datetime, timedelta
 
@@ -7,19 +8,27 @@ import httpx
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, Update, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, Update, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 
 # ================== ЛОГИ ==================
 logging.basicConfig(level=logging.INFO)
 
 # ================== ENV ==================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<your-app>.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<app>.onrender.com/webhook
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "savol_secret")
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # например 123456789
+
+# Live-поиск
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # если нет — будет фолбек без поиска
+
+# Админ для ручной активации (MVP)
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # например "123456789"
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -50,7 +59,7 @@ def violates_policy(text: str) -> bool:
     t = text.lower()
     return any(re.search(rx, t) for rx in ILLEGAL_PATTERNS)
 
-# ================== ТАРИФЫ ==================
+# ================== ТАРИФЫ/ЛИМИТЫ ==================
 FREE_LIMIT = 2
 TARIFFS = {
     "start": {
@@ -60,23 +69,23 @@ TARIFFS = {
         "active": True,
         "duration_days": 30,
     },
-    "business": {"title": "Бизнес", "price_uzs": 119_000, "desc": [
-        "До 500 сообщений/мес", "Инструкции и чек-листы", "Простые документы (docx/pdf)"
-    ], "active": False, "duration_days": 30},
-    "pro": {"title": "PRO", "price_uzs": 249_000, "desc": [
-        "Высокие лимиты", "Картинки и сложные документы", "Приоритетная очередь"
-    ], "active": False, "duration_days": 30},
+    "business": {"title": "Бизнес", "price_uzs": 119_000,
+                 "desc": ["До 500 сообщений/мес", "Инструкции и чек-листы", "Простые документы (docx/pdf)"],
+                 "active": False, "duration_days": 30},
+    "pro": {"title": "PRO", "price_uzs": 249_000,
+            "desc": ["Высокие лимиты", "Картинки и сложные документы", "Приоритетная очередь"],
+            "active": False, "duration_days": 30},
 }
 
-# ================== ТЕМЫ (категории) ==================
+# ================== ТЕМЫ ==================
 TOPICS = {
-    "daily": {"title_ru": "Быт", "title_uz": "Maishiy", "hint": "Даёшь простые практичные советы, чек-листы и шаги."},
-    "finance": {"title_ru": "Финансы", "title_uz": "Moliya", "hint": "Объясняй спокойно, с цифрами и примерами. Без персональных финсоветов высокого риска."},
-    "gov": {"title_ru": "Госуслуги", "title_uz": "Davlat xizmatlari", "hint": "Ссылайся на общие процедуры, документы и шаги подачи."},
-    "biz": {"title_ru": "Бизнес", "title_uz": "Biznes", "hint": "Давай краткие инструкции по регистрации/отчётности/документам."},
-    "edu": {"title_ru": "Учёба", "title_uz": "Ta’lim", "hint": "Объясняй возможности и шаги поступления/обучения."},
-    "it": {"title_ru": "IT", "title_uz": "IT", "hint": "Будь конкретным, избегай незаконного софта/взлома."},
-    "health": {"title_ru": "Здоровье (общ.)", "title_uz": "Sog‘liq (umumiy)", "hint": "Только общая информация. Рекомендуй обратиться к врачу при симптомах."},
+    "daily":   {"title_ru": "Быт",              "title_uz": "Maishiy",            "hint": "Практичные советы, чек-листы и шаги."},
+    "finance": {"title_ru": "Финансы",          "title_uz": "Moliya",             "hint": "Объясняй с цифрами и примерами. Без рискованных персональных рекомендаций."},
+    "gov":     {"title_ru": "Госуслуги",        "title_uz": "Davlat xizmatlari", "hint": "Опиши процедуру, документы и шаги подачи."},
+    "biz":     {"title_ru": "Бизнес",           "title_uz": "Biznes",             "hint": "Краткие инструкции по регистрации/отчётности/документам."},
+    "edu":     {"title_ru": "Учёба",            "title_uz": "Ta’lim",             "hint": "Расскажи про поступление/обучение и шаги."},
+    "it":      {"title_ru": "IT",               "title_uz": "IT",                 "hint": "Технически и конкретно. Не советуй ничего незаконного."},
+    "health":  {"title_ru": "Здоровье (общ.)",  "title_uz": "Sog‘liq (umumiy)",   "hint": "Только общая информация. Советуй обращаться к врачу."},
 }
 
 def topic_kb(lang="ru", current=None):
@@ -89,8 +98,8 @@ def topic_kb(lang="ru", current=None):
     rows.append([InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="topic:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ================== ПАМЯТЬ (MVP, без БД) ==================
-USERS = {}  # tg_id -> {"free_used": int, "plan": str, "paid_until": datetime|None, "lang": "ru"|"uz", "topic": str|None}
+# ================== ПАМЯТЬ (MVP) ==================
+USERS = {}  # tg_id -> {"free_used": int, "plan": str, "paid_until": dt|None, "lang": "ru"/"uz", "topic": str|None}
 
 def get_user(tg_id: int):
     if tg_id not in USERS:
@@ -109,7 +118,7 @@ def pay_kb():
 def tariffs_text(lang='ru'):
     def bullet(lines): return "\n".join(f"• {x}" for x in lines)
     txt = []
-    for key in ("start", "business", "pro"):
+    for key in ("start","business","pro"):
         t = TARIFFS[key]
         badge = "(доступен)" if t["active"] else "(скоро)"
         if lang == 'uz':
@@ -128,11 +137,10 @@ BASE_SYSTEM_PROMPT = (
 )
 
 async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
+    """Обычный ответ ИИ без веб-поиска"""
     if not OPENAI_API_KEY:
         return f"Вы спросили: {user_text}"
-    system = BASE_SYSTEM_PROMPT
-    if topic_hint:
-        system += f" Учитывай контекст темы: {topic_hint}"
+    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {"model": OPENAI_MODEL, "temperature": 0.6,
                "messages": [{"role": "system", "content": system},
@@ -142,6 +150,63 @@ async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
 
+# ---- Live-поиск ----
+TIME_SENSITIVE_PATTERNS = [
+    r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
+    r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
+    r"\b(bugun|hozir|narx|kurs|yangilik)\b",
+]
+
+def is_time_sensitive(q: str) -> bool:
+    t = q.lower()
+    return any(re.search(rx, t) for rx in TIME_SENSITIVE_PATTERNS)
+
+async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
+    if not TAVILY_API_KEY:
+        return None
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "advanced",
+        "max_results": max_results,
+        "include_answer": True,
+        "include_domains": [],  # можно ограничить домены (gov.uz и т.п.)
+    }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        r = await client.post("https://api.tavily.com/search", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str:
+    data = await web_search_tavily(user_text)
+    if not data:
+        return await ask_gpt(user_text, topic_hint)
+
+    snippets, sources_for_user = [], []
+    for item in (data.get("results") or [])[:5]:
+        title = (item.get("title") or "")[:120]
+        url = item.get("url") or ""
+        content = (item.get("content") or "")[:500]
+        snippets.append(f"- {title}\n{content}\nИсточник: {url}")
+        sources_for_user.append(f"• {title} — {url}")
+
+    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на предоставленные источники. Кратко, по делу."
+    if topic_hint:
+        system += f" Учитывай контекст темы: {topic_hint}"
+    user_augmented = f"{user_text}\n\nИСТОЧНИКИ:\n" + "\n\n".join(snippets)
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {"model": OPENAI_MODEL, "temperature": 0.4,
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": user_augmented}]}
+    async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
+        r = await client.post("/chat/completions", headers=headers, json=payload)
+        r.raise_for_status()
+        answer = r.json()["choices"][0]["message"]["content"].strip()
+
+    tail = "\n\nИсточники:\n" + "\n".join(sources_for_user)
+    return answer + tail
+
 # ================== КОМАНДЫ ==================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -150,25 +215,24 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! / Assalomu alaykum!\n"
         "Я — SavolBot от TripleA. Первые 2 ответа — бесплатно, дальше по подписке «Старт».\n"
-        "Напишите вопрос или выберите тему через /topics."
+        "Задайте вопрос или выберите тему: /topics"
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "ℹ️ Как пользоваться ботом:\n"
-        "1) Просто задайте вопрос текстом.\n"
-        "2) Выберите тему через /topics — так ответы будут ещё точнее.\n"
-        "3) Первые 2 ответа — бесплатно; затем оформите подписку через /tariffs.\n"
-        "4) Всё строго в рамках законодательства РУз."
+        "ℹ️ Как пользоваться:\n"
+        "1) Напишите вопрос (RU/UZ). Язык ответа = язык вопроса.\n"
+        "2) /topics — выберите тему для более точных ответов.\n"
+        "3) Первые 2 ответа — бесплатно; дальше /tariffs.\n"
+        "4) Для свежих данных используйте /asklive вопрос."
     )
 
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
     await message.answer(
-        "🤖 SavolBot — проект TripleA. Цель — быстрые и понятные ответы 24/7.\n"
-        "Работает на базе GPT. Темы и двуязычность RU/UZ.\n"
-        "Поддержать проект и снять лимиты можно подпиской: /tariffs."
+        "🤖 SavolBot — проект TripleA. Умные ответы 24/7 на базе GPT, строго в рамках закона РУз.\n"
+        "Поддержать проект и снять лимиты — /tariffs."
     )
 
 @dp.message(Command("tariffs"))
@@ -181,11 +245,10 @@ async def cmd_myplan(message: Message):
     u = get_user(message.from_user.id)
     status = "активна" if has_active_sub(u) else "нет"
     until = u["paid_until"].isoformat() if u["paid_until"] else "—"
-    topic = u["topic"] or "—"
+    topic = u.get("topic") or "—"
     await message.answer(
         f"Ваш план: {u['plan']}\nПодписка: {status}\nОплачено до: {until}\n"
-        f"Выбранная тема: {topic}\n"
-        f"Бесплатных использовано: {u['free_used']}/{FREE_LIMIT}"
+        f"Выбранная тема: {topic}\nБесплатных использовано: {u['free_used']}/{FREE_LIMIT}"
     )
 
 @dp.message(Command("topics"))
@@ -195,6 +258,24 @@ async def cmd_topics(message: Message):
     head = "🗂 Выберите тему (не влияет на цену, только на стиль ответа):" if lang == "ru" \
         else "🗂 Mavzuni tanlang (narxga ta’sir qilmaydi, faqat javob ohangiga):"
     await message.answer(head, reply_markup=topic_kb(lang, current=u.get("topic")))
+
+@dp.message(Command("asklive"))
+async def cmd_asklive(message: Message):
+    u = get_user(message.from_user.id)
+    q = message.text.replace("/asklive", "", 1).strip()
+    if not q:
+        return await message.answer("Напишите так: /asklive ваш вопрос")
+    if not has_active_sub(u) and u["free_used"] >= FREE_LIMIT:
+        return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
+    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint") if u.get("topic") else None
+    try:
+        reply = await answer_with_live_search(q, topic_hint)
+        await message.answer(reply)
+    except Exception as e:
+        logging.exception("Live error: %s", e)
+        return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
+    if not has_active_sub(u):
+        u["free_used"] += 1
 
 # ================== CALLBACKS ==================
 @dp.callback_query(F.data == "show_tariffs")
@@ -209,7 +290,9 @@ async def cb_subscribe_start(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Готово (я оплатил)", callback_data="paid_start_done")]
     ])
-    await call.message.answer(f"💳 «Старт» — {TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}", reply_markup=kb)
+    await call.message.answer(
+        f"💳 «Старт» — {TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}", reply_markup=kb
+    )
     await call.answer()
 
 @dp.callback_query(F.data == "paid_start_done")
@@ -241,7 +324,7 @@ async def cb_topic(call: CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
         await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
 
-# админская ручная активация (MVP)
+# Админ: ручная активация (MVP)
 @dp.message(Command("grant_start"))
 async def cmd_grant_start(message: Message):
     if str(message.from_user.id) != str(ADMIN_CHAT_ID):
@@ -265,33 +348,32 @@ async def handle_text(message: Message):
     text = message.text.strip()
     u = get_user(message.from_user.id)
 
-    # Язык
+    # язык
     if is_uzbek(text):
         u["lang"] = "uz"
 
-    # Модерация
+    # модерация
     if violates_policy(text):
         return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
 
-    # Лимиты / пэйволл
+    # лимиты
     if not has_active_sub(u) and u["free_used"] >= FREE_LIMIT:
-        return await message.answer(
-            "💳 Доступ к ответам ограничен. Оформите подписку:",
-            reply_markup=pay_kb()
-        )
+        return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
 
-    # Тема → намёк системе
-    topic_hint = TOPICS.get(u["topic"], {}).get("hint") if u.get("topic") else None
+    # тема → подсказка
+    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint") if u.get("topic") else None
 
-    # Ответ ИИ
+    # если вопрос «про сейчас», включаем live-поиск
     try:
-        reply = await ask_gpt(text, topic_hint)
+        if is_time_sensitive(text):
+            reply = await answer_with_live_search(text, topic_hint)
+        else:
+            reply = await ask_gpt(text, topic_hint)
         await message.answer(reply)
     except Exception as e:
         logging.exception("OpenAI error: %s", e)
         return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
 
-    # Списываем бесплатный, если без подписки
     if not has_active_sub(u):
         u["free_used"] += 1
 
