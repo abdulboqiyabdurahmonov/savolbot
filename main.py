@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import Counter, defaultdict
 
 import httpx
 from fastapi import FastAPI, Request
@@ -34,6 +35,9 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # например "123456789"
 
 # Персистентное хранилище пользователей
 USERS_DB_PATH = os.getenv("USERS_DB_PATH", "users_limits.json")
+
+# Файл аналитики (одна строка JSON на событие)
+ANALYTICS_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics_events.jsonl")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -296,13 +300,79 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str
     cache_set(user_text, final_answer)
     return final_answer
 
+# ================== АНАЛИТИКА ==================
+def _ts() -> str:
+    return datetime.utcnow().isoformat()
+
+def log_event(user_id: int, name: str, **payload):
+    try:
+        path = Path(ANALYTICS_DB_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"ts": _ts(), "user_id": user_id, "event": name, **payload}
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logging.warning("log_event failed: %s", e)
+
+def load_events(days: int | None = None):
+    path = Path(ANALYTICS_DB_PATH)
+    if not path.exists():
+        return []
+    cutoff = None
+    if days is not None:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+    out = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                    if cutoff:
+                        ts = datetime.fromisoformat(ev.get("ts","").split("+")[0])
+                        if ts < cutoff:
+                            continue
+                    out.append(ev)
+                except Exception:
+                    continue
+    except Exception as e:
+        logging.warning("load_events failed: %s", e)
+    return out
+
+def format_stats(days: int | None = 7):
+    evs = load_events(days)
+    total = len(evs)
+    users = {e["user_id"] for e in evs}
+    per_event = Counter(e["event"] for e in evs)
+    # вопросы:
+    q = [e for e in evs if e["event"] == "question"]
+    topics = Counter((e.get("topic") or "—") for e in q)
+    live_used = sum(1 for e in q if e.get("live"))
+    time_sens = sum(1 for e in q if e.get("time_sensitive"))
+    # подписки:
+    grants = [e for e in evs if e["event"] == "subscription_granted"]
+    paid_clicks = [e for e in evs if e["event"] == "paid_done_click"]
+
+    active_subs_now = sum(1 for u in USERS.values() if u["plan"] != "free" and has_active_sub(u))
+
+    lines = []
+    period = f"за последние {days} дн." if days else "за всё время"
+    lines.append(f"📊 Статистика {period}")
+    lines.append(f"• Событий: {total} | Уник. пользователей: {len(users)}")
+    lines.append(f"• Вопросов: {len(q)} (Live: {live_used}, срочные: {time_sens})")
+    if topics:
+        top = ", ".join(f"{k}:{v}" for k, v in topics.most_common(6))
+        lines.append(f"• Тематики (топ): {top}")
+    lines.append(f"• Кнопка «Оплатил»: {len(paid_clicks)} | Активаций подписки: {len(grants)}")
+    lines.append(f"• Активных подписок сейчас: {active_subs_now}")
+    return "\n".join(lines)
+
 # ================== КОМАНДЫ ==================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
-    # Обновим язык и сохраним
     u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"
     save_users()
+    log_event(message.from_user.id, "start", lang=u["lang"])
     await message.answer(
         "👋 Привет! / Assalomu alaykum!\n"
         "Первые 2 ответа — бесплатно, дальше подписка «Старт».\n"
@@ -312,6 +382,7 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
+    log_event(message.from_user.id, "help")
     await message.answer(
         "ℹ️ Как пользоваться:\n"
         "1) Пишите вопрос (RU/UZ). Язык ответа = язык вопроса.\n"
@@ -323,6 +394,7 @@ async def cmd_help(message: Message):
 
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
+    log_event(message.from_user.id, "about")
     await message.answer(
         "🤖 SavolBot — проект TripleA. Ответы на базе GPT, строго в рамках закона РУз.\n"
         "Поддержать проект и снять лимиты — /tariffs."
@@ -331,6 +403,7 @@ async def cmd_about(message: Message):
 @dp.message(Command("tariffs"))
 async def cmd_tariffs(message: Message):
     u = get_user(message.from_user.id)
+    log_event(message.from_user.id, "view_tariffs")
     await message.answer(tariffs_text(u["lang"]), reply_markup=pay_kb())
 
 @dp.message(Command("myplan"))
@@ -340,6 +413,7 @@ async def cmd_myplan(message: Message):
     until = u["paid_until"].isoformat() if u["paid_until"] else "—"
     topic = u.get("topic") or "—"
     live = "вкл" if u.get("live") else "выкл"
+    log_event(message.from_user.id, "myplan_open")
     await message.answer(
         f"Ваш план: {u['plan']} | Live-поиск: {live}\nПодписка: {status} (до {until})\n"
         f"Тема: {topic}\nБесплатных использовано: {u['free_used']}/{FREE_LIMIT}"
@@ -349,6 +423,7 @@ async def cmd_myplan(message: Message):
 async def cmd_topics(message: Message):
     u = get_user(message.from_user.id)
     lang = u["lang"]
+    log_event(message.from_user.id, "topics_open")
     head = "🗂 Выберите тему (не влияет на цену, только на стиль ответа):" if lang == "ru" \
         else "🗂 Mavzuni tanlang (narxga ta’sir qilmaydi, faqat javob ohangiga):"
     await message.answer(head, reply_markup=topic_kb(lang, current=u.get("topic")))
@@ -365,6 +440,7 @@ async def cmd_asklive(message: Message):
     try:
         reply = await answer_with_live_search(q, topic_hint)
         await message.answer(reply)
+        log_event(message.from_user.id, "question", mode="asklive", topic=u.get("topic"), live=True, time_sensitive=True)
     except Exception as e:
         logging.exception("Live error: %s", e)
         return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
@@ -377,6 +453,7 @@ async def cmd_live_on(message: Message):
     u = get_user(message.from_user.id)
     u["live"] = True
     save_users()
+    log_event(message.from_user.id, "live_on")
     await message.answer("✅ Live-поиск включён. Все ваши вопросы будут проверяться по интернет-источникам.")
 
 @dp.message(Command("live_off"))
@@ -384,6 +461,7 @@ async def cmd_live_off(message: Message):
     u = get_user(message.from_user.id)
     u["live"] = False
     save_users()
+    log_event(message.from_user.id, "live_off")
     await message.answer("⏹ Live-поиск выключён. Вернулись к обычным ответам модели.")
 
 # ---- cache utils ----
@@ -400,27 +478,40 @@ async def cmd_cache_clear(message: Message):
     LIVE_CACHE.clear()
     await message.answer("🧹 Кэш live-поиска очищен.")
 
+# ---- admin stats ----
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    # /stats [дней]  (по умолчанию 7)
+    if ADMIN_CHAT_ID and str(message.from_user.id) != str(ADMIN_CHAT_ID):
+        return await message.answer("Команда доступна администратору.")
+    parts = message.text.strip().split()
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
+    text = format_stats(days)
+    await message.answer(text)
+
 # ================== CALLBACKS ==================
 @dp.callback_query(F.data == "show_tariffs")
 async def cb_show_tariffs(call: CallbackQuery):
     u = get_user(call.from_user.id)
+    log_event(call.from_user.id, "view_tariffs_click")
     await call.message.edit_text(tariffs_text(u["lang"]), reply_markup=pay_kb())
     await call.answer()
 
 @dp.callback_query(F.data == "subscribe_start")
 async def cb_subscribe_start(call: CallbackQuery):
+    log_event(call.from_user.id, "subscribe_start_open")
     pay_link = "https://pay.example.com/savolbot/start"  # заглушка
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Готово (я оплатил)", callback_data="paid_start_done")]
     ])
     await call.message.answer(
-        f"💳 «Старт» — {TARIFFS['start']['price_узs'] if 'price_узs' in TARIFFS['start'] else TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}",
-        reply_markup=kb
+        f"💳 «Старт» — {TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}", reply_markup=kb
     )
     await call.answer()
 
 @dp.callback_query(F.data == "paid_start_done")
 async def cb_paid_done(call: CallbackQuery):
+    log_event(call.from_user.id, "paid_done_click")
     if ADMIN_CHAT_ID:
         await bot.send_message(
             int(ADMIN_CHAT_ID),
@@ -445,7 +536,8 @@ async def cb_topic(call: CallbackQuery):
         u["topic"] = key
         save_users()
         lang = u["lang"]
-        title = TOPICS[key]["title_уз"] if "title_уз" in TOPICS[key] else (TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"])
+        title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
+        log_event(call.from_user.id, "topic_select", topic=key)
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
         await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
 
@@ -462,6 +554,7 @@ async def cmd_grant_start(message: Message):
     u["plan"] = "start"
     u["paid_until"] = datetime.utcnow() + timedelta(days=TARIFFS["start"]["duration_days"])
     save_users()
+    log_event(message.from_user.id, "subscription_granted", target=target_id, plan="start", paid_until=u["paid_until"].isoformat())
     await message.answer(f"✅ Активирован «Старт» для {target_id} до {u['paid_until'].isoformat()}")
     try:
         await bot.send_message(target_id, "✅ Подписка «Старт» активирована. Приятного использования!")
@@ -481,22 +574,27 @@ async def handle_text(message: Message):
 
     # модерация
     if violates_policy(text):
+        log_event(message.from_user.id, "question_blocked", reason="policy")
         return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
 
     # лимиты
     if not has_active_sub(u) and u["free_used"] >= FREE_LIMIT:
+        log_event(message.from_user.id, "paywall_shown")
         return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
 
     # тема → подсказка
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint") if u.get("topic") else None
+    time_sens = is_time_sensitive(text)
+    use_live = u.get("live") or time_sens
 
-    # если включён per-user live или вопрос «про сейчас» → live-поиск
+    # ответ
     try:
-        if u.get("live") or is_time_sensitive(text):
+        if use_live:
             reply = await answer_with_live_search(text, topic_hint)
         else:
             reply = await ask_gpt(text, topic_hint)
         await message.answer(reply)
+        log_event(message.from_user.id, "question", topic=u.get("topic"), live=use_live, time_sensitive=time_sens)
     except Exception as e:
         logging.exception("OpenAI error: %s", e)
         return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
@@ -519,6 +617,7 @@ async def on_startup():
     # Загружаем пользователей с диска
     load_users()
     logging.info("Users DB path: %s", USERS_DB_PATH)
+    logging.info("Analytics path: %s", ANALYTICS_DB_PATH)
 
     if TELEGRAM_TOKEN and WEBHOOK_URL:
         async with httpx.AsyncClient(timeout=15.0) as client:
