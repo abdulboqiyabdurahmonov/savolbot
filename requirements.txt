@@ -3,3 +3,6 @@ openai
 gspread
 google-auth
 duckduckgo-search
+fastapi
+uvicorn
+httpx~=0.24.0
