@@ -25,7 +25,7 @@ OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # Live-поиск
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # если нет — будет фолбек без поиска
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # если нет — фолбек без поиска
 
 # Админ для ручной активации (MVP)
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # например "123456789"
@@ -99,11 +99,12 @@ def topic_kb(lang="ru", current=None):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ================== ПАМЯТЬ (MVP) ==================
-USERS = {}  # tg_id -> {"free_used": int, "plan": str, "paid_until": dt|None, "lang": "ru"/"uz", "topic": str|None}
+# tg_id -> {"free_used": int, "plan": str, "paid_until": dt|None, "lang": "ru"/"uz", "topic": str|None, "live": bool}
+USERS = {}
 
 def get_user(tg_id: int):
     if tg_id not in USERS:
-        USERS[tg_id] = {"free_used": 0, "plan": "free", "paid_until": None, "lang": "ru", "topic": None}
+        USERS[tg_id] = {"free_used": 0, "plan": "free", "paid_until": None, "lang": "ru", "topic": None, "live": False}
     return USERS[tg_id]
 
 def has_active_sub(user: dict) -> bool:
@@ -137,7 +138,6 @@ BASE_SYSTEM_PROMPT = (
 )
 
 async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
-    """Обычный ответ ИИ без веб-поиска"""
     if not OPENAI_API_KEY:
         return f"Вы спросили: {user_text}"
     system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
@@ -151,10 +151,13 @@ async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
         return r.json()["choices"][0]["message"]["content"].strip()
 
 # ---- Live-поиск ----
+# расширили детектор: текущее время + должности/персоны
 TIME_SENSITIVE_PATTERNS = [
     r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
     r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
     r"\b(bugun|hozir|narx|kurs|yangilik)\b",
+    r"\b(кто|как зовут|фамилия|председател[ья]?|директор|гендиректор|ceo|chairman|руководител[ья]?)\b",
+    r"\b(банк|акб|ооо|ао|компания|министерств[оа])\b.*",  # «кто руководитель банка/компании...»
 ]
 
 def is_time_sensitive(q: str) -> bool:
@@ -170,7 +173,7 @@ async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
         "search_depth": "advanced",
         "max_results": max_results,
         "include_answer": True,
-        "include_domains": [],  # можно ограничить домены (gov.uz и т.п.)
+        "include_domains": [],
     }
     async with httpx.AsyncClient(timeout=25.0) as client:
         r = await client.post("https://api.tavily.com/search", json=payload)
@@ -214,24 +217,26 @@ async def cmd_start(message: Message):
     u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"
     await message.answer(
         "👋 Привет! / Assalomu alaykum!\n"
-        "Я — SavolBot от TripleA. Первые 2 ответа — бесплатно, дальше по подписке «Старт».\n"
-        "Задайте вопрос или выберите тему: /topics"
+        "Первые 2 ответа — бесплатно, дальше подписка «Старт».\n"
+        "Задайте вопрос или выберите тему: /topics\n"
+        "Для свежих данных включите live-поиск: /live_on"
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
         "ℹ️ Как пользоваться:\n"
-        "1) Напишите вопрос (RU/UZ). Язык ответа = язык вопроса.\n"
+        "1) Пишите вопрос (RU/UZ). Язык ответа = язык вопроса.\n"
         "2) /topics — выберите тему для более точных ответов.\n"
         "3) Первые 2 ответа — бесплатно; дальше /tariffs.\n"
-        "4) Для свежих данных используйте /asklive вопрос."
+        "4) /live_on — включить интернет-поиск для всех ваших вопросов, /live_off — выключить.\n"
+        "5) Для разового запроса можно: /asklive вопрос."
     )
 
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
     await message.answer(
-        "🤖 SavolBot — проект TripleA. Умные ответы 24/7 на базе GPT, строго в рамках закона РУз.\n"
+        "🤖 SavolBot — проект TripleA. Ответы на базе GPT, строго в рамках закона РУз.\n"
         "Поддержать проект и снять лимиты — /tariffs."
     )
 
@@ -246,9 +251,10 @@ async def cmd_myplan(message: Message):
     status = "активна" if has_active_sub(u) else "нет"
     until = u["paid_until"].isoformat() if u["paid_until"] else "—"
     topic = u.get("topic") or "—"
+    live = "вкл" if u.get("live") else "выкл"
     await message.answer(
-        f"Ваш план: {u['plan']}\nПодписка: {status}\nОплачено до: {until}\n"
-        f"Выбранная тема: {topic}\nБесплатных использовано: {u['free_used']}/{FREE_LIMIT}"
+        f"Ваш план: {u['plan']} | Live-поиск: {live}\nПодписка: {status} (до {until})\n"
+        f"Тема: {topic}\nБесплатных использовано: {u['free_used']}/{FREE_LIMIT}"
     )
 
 @dp.message(Command("topics"))
@@ -276,6 +282,18 @@ async def cmd_asklive(message: Message):
         return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
     if not has_active_sub(u):
         u["free_used"] += 1
+
+@dp.message(Command("live_on"))
+async def cmd_live_on(message: Message):
+    u = get_user(message.from_user.id)
+    u["live"] = True
+    await message.answer("✅ Live-поиск включён. Все ваши вопросы будут проверяться по интернет-источникам.")
+
+@dp.message(Command("live_off"))
+async def cmd_live_off(message: Message):
+    u = get_user(message.from_user.id)
+    u["live"] = False
+    await message.answer("⏹ Live-поиск выключён. Вернулись к обычным ответам модели.")
 
 # ================== CALLBACKS ==================
 @dp.callback_query(F.data == "show_tariffs")
@@ -363,9 +381,9 @@ async def handle_text(message: Message):
     # тема → подсказка
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint") if u.get("topic") else None
 
-    # если вопрос «про сейчас», включаем live-поиск
+    # если включён per-user live или вопрос «про сейчас» → live-поиск
     try:
-        if is_time_sensitive(text):
+        if u.get("live") or is_time_sensitive(text):
             reply = await answer_with_live_search(text, topic_hint)
         else:
             reply = await ask_gpt(text, topic_hint)
@@ -392,7 +410,7 @@ async def on_startup():
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-                json={"url": WEBHOOK_URL, "secret_token": WEBHOOK_SECRET}
+                json={"url": WEBHOOK_URL, "secret_token": {WEBHOOK_SECRET}}
             )
             logging.info("setWebhook: %s %s", resp.status_code, resp.text)
 
