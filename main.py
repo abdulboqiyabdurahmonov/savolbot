@@ -277,35 +277,47 @@ _sheets_client = None
 _sheets_ws = None
 
 def _init_sheets():
+    """
+    Жёсткая инициализация Google Sheets:
+    - добавлены drive-скоупы (на случай странных прав)
+    - логируем список листов
+    - если нужного листа нет — создаём
+    """
     global _sheets_client, _sheets_ws
 
     if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and SHEETS_WORKSHEET):
         logging.error("Sheets env not set: GOOGLE_CREDENTIALS / SHEETS_SPREADSHEET_ID / SHEETS_WORKSHEET")
         return
 
-    # 2.1 Парсим JSON и чётко логируем, если что-то не так
     try:
         creds_info = json.loads(GOOGLE_CREDENTIALS)
-        # sanity-check
-        assert "client_email" in creds_info and "private_key" in creds_info
-    except Exception:
-        logging.exception("Sheets creds JSON parse failed")
-        return
-
-    try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"  # добавили на всякий
+        ]
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         _sheets_client = gspread.authorize(creds)
 
         sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+
+        # Логируем доступные листы
+        try:
+            ws_titles = [ws.title for ws in sh.worksheets()]
+            logging.info("Sheets worksheets: %s", ws_titles)
+        except Exception:
+            logging.exception("Failed to list worksheets")
+
+        # Пробуем получить нужный лист
         try:
             _sheets_ws = sh.worksheet(SHEETS_WORKSHEET)
         except gspread.WorksheetNotFound:
+            logging.warning("Worksheet '%s' not found, creating…", SHEETS_WORKSHEET)
             _sheets_ws = sh.add_worksheet(title=SHEETS_WORKSHEET, rows=2000, cols=20)
             _sheets_ws.append_row(
                 ["ts","user_id","event","topic","live","time_sensitive","mode","extra"],
                 value_input_option="RAW"
             )
+
         logging.info("Sheets OK: spreadsheet=%s worksheet=%s", SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET)
     except Exception:
         logging.exception("Sheets init failed")
