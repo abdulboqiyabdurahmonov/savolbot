@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
@@ -30,6 +31,9 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # если нет — фолбек
 
 # Админ для ручной активации (MVP)
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # например "123456789"
+
+# Персистентное хранилище пользователей
+USERS_DB_PATH = os.getenv("USERS_DB_PATH", "data/users.json")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -99,14 +103,66 @@ def topic_kb(lang="ru", current=None):
     rows.append([InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="topic:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ================== ПАМЯТЬ (MVP) ==================
+# ================== ПЕРСИСТЕНТНОЕ ХРАНИЛИЩЕ USERS ==================
 # tg_id -> {"free_used": int, "plan": str, "paid_until": dt|None, "lang": "ru"/"uz", "topic": str|None, "live": bool}
-USERS = {}
+USERS: dict[int, dict] = {}
+
+def _serialize_user(u: dict) -> dict:
+    return {
+        "free_used": int(u.get("free_used", 0)),
+        "plan": u.get("plan", "free"),
+        "paid_until": u["paid_until"].isoformat() if u.get("paid_until") else None,
+        "lang": u.get("lang", "ru"),
+        "topic": u.get("topic"),
+        "live": bool(u.get("live", False)),
+    }
+
+def save_users():
+    try:
+        path = Path(USERS_DB_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        to_dump = {str(k): _serialize_user(v) for k, v in USERS.items()}
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(to_dump, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning("save_users failed: %s", e)
+
+def load_users():
+    global USERS
+    path = Path(USERS_DB_PATH)
+    if not path.exists():
+        USERS = {}
+        return
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        USERS = {}
+        for k, v in data.items():
+            pu = v.get("paid_until")
+            try:
+                paid_until = datetime.fromisoformat(pu) if pu else None
+            except Exception:
+                paid_until = None
+            USERS[int(k)] = {
+                "free_used": int(v.get("free_used", 0)),
+                "plan": v.get("plan", "free"),
+                "paid_until": paid_until,
+                "lang": v.get("lang", "ru"),
+                "topic": v.get("topic"),
+                "live": bool(v.get("live", False)),
+            }
+        logging.info("Users loaded: %d", len(USERS))
+    except Exception as e:
+        logging.exception("load_users failed: %s")
+        USERS = {}
 
 def get_user(tg_id: int):
-    if tg_id not in USERS:
-        USERS[tg_id] = {"free_used": 0, "plan": "free", "paid_until": None, "lang": "ru", "topic": None, "live": False}
-    return USERS[tg_id]
+    u = USERS.get(tg_id)
+    if not u:
+        u = {"free_used": 0, "plan": "free", "paid_until": None, "lang": "ru", "topic": None, "live": False}
+        USERS[tg_id] = u
+        save_users()
+    return u
 
 def has_active_sub(user: dict) -> bool:
     return user["plan"] in ("start", "business", "pro") and user["paid_until"] and user["paid_until"] > datetime.utcnow()
@@ -164,7 +220,7 @@ def is_time_sensitive(q: str) -> bool:
     return any(re.search(rx, t) for rx in TIME_SENSITIVE_PATTERNS)
 
 # ====== КЭШ ДЛЯ LIVE-ПОИСКА ======
-CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))  # 24 часа по умолчанию
+CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))  # 24 часа
 CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
 LIVE_CACHE: dict[str, dict] = {}  # key -> {"ts": float, "answer": str}
 
@@ -182,7 +238,6 @@ def cache_get(q: str) -> str | None:
     return item["answer"]
 
 def cache_set(q: str, answer: str):
-    # простейшее ограничение размера: выкидываем самый старый
     if len(LIVE_CACHE) >= CACHE_MAX_ENTRIES:
         oldest_key = min(LIVE_CACHE, key=lambda kk: LIVE_CACHE[kk]["ts"])
         LIVE_CACHE.pop(oldest_key, None)
@@ -205,12 +260,10 @@ async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
         return r.json()
 
 async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str:
-    # 1) пытаемся взять из кэша финальный ответ
     cached = cache_get(user_text)
     if cached:
         return cached + "\n\n(из кэша за последние 24 часа)"
 
-    # 2) иначе — реальный поиск
     data = await web_search_tavily(user_text)
     if not data:
         return await ask_gpt(user_text, topic_hint)
@@ -240,7 +293,6 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str
     tail = "\n\nИсточники:\n" + "\n".join(sources_for_user)
     final_answer = answer + tail
 
-    # 3) кладём в кэш
     cache_set(user_text, final_answer)
     return final_answer
 
@@ -248,7 +300,9 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
+    # Обновим язык и сохраним
     u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"
+    save_users()
     await message.answer(
         "👋 Привет! / Assalomu alaykum!\n"
         "Первые 2 ответа — бесплатно, дальше подписка «Старт».\n"
@@ -316,23 +370,25 @@ async def cmd_asklive(message: Message):
         return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
     if not has_active_sub(u):
         u["free_used"] += 1
+        save_users()
 
 @dp.message(Command("live_on"))
 async def cmd_live_on(message: Message):
     u = get_user(message.from_user.id)
     u["live"] = True
+    save_users()
     await message.answer("✅ Live-поиск включён. Все ваши вопросы будут проверяться по интернет-источникам.")
 
 @dp.message(Command("live_off"))
 async def cmd_live_off(message: Message):
     u = get_user(message.from_user.id)
     u["live"] = False
+    save_users()
     await message.answer("⏹ Live-поиск выключён. Вернулись к обычным ответам модели.")
 
 # ---- cache utils ----
 @dp.message(Command("cache_info"))
 async def cmd_cache_info(message: Message):
-    # доступ открыт всем — это harmless; если хочешь, можно ограничить админом
     size = len(LIVE_CACHE)
     ttl_h = round(CACHE_TTL_SECONDS / 3600, 1)
     await message.answer(f"🗄 Кэш live-поиска: {size} записей, TTL ≈ {ttl_h} ч., max {CACHE_MAX_ENTRIES}")
@@ -386,6 +442,7 @@ async def cb_topic(call: CallbackQuery):
         return await call.answer("OK")
     if key in TOPICS:
         u["topic"] = key
+        save_users()
         lang = u["lang"]
         title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
@@ -403,6 +460,7 @@ async def cmd_grant_start(message: Message):
     u = get_user(target_id)
     u["plan"] = "start"
     u["paid_until"] = datetime.utcnow() + timedelta(days=TARIFFS["start"]["duration_days"])
+    save_users()
     await message.answer(f"✅ Активирован «Старт» для {target_id} до {u['paid_until'].isoformat()}")
     try:
         await bot.send_message(target_id, "✅ Подписка «Старт» активирована. Приятного использования!")
@@ -418,6 +476,7 @@ async def handle_text(message: Message):
     # язык
     if is_uzbek(text):
         u["lang"] = "uz"
+        save_users()
 
     # модерация
     if violates_policy(text):
@@ -443,6 +502,7 @@ async def handle_text(message: Message):
 
     if not has_active_sub(u):
         u["free_used"] += 1
+        save_users()
 
 # ================== WEBHOOK ==================
 @app.post("/webhook")
@@ -455,6 +515,10 @@ async def telegram_webhook(request: Request):
 
 @app.on_event("startup")
 async def on_startup():
+    # Загружаем пользователей с диска
+    load_users()
+    logging.info("Users DB path: %s", USERS_DB_PATH)
+
     if TELEGRAM_TOKEN and WEBHOOK_URL:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
