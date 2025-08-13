@@ -45,13 +45,16 @@ SHEETS_WORKSHEET = os.getenv("SHEETS_WORKSHEET", "Events")
 # поддерживаем два имени переменной для ключа
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# Whitelist (безлимит для указанных юзеров)
-WHITELIST_USERS = set(
-    int(x) for x in os.getenv("WHITELIST_USERS", "557891018", "1942344627").split(",") if x.strip().isdigit()
-)
+# Белый список (VIP) — пользователи без лимитов
+# Можно задавать через ENV WHITELIST_USERS="557891018,1942344627"
+WL_RAW = os.getenv("WHITELIST_USERS", "557891018,1942344627")
+try:
+    WHITELIST_USERS = {int(x) for x in WL_RAW.split(",") if x.strip().isdigit()}
+except Exception:
+    WHITELIST_USERS = set()
 
-def is_whitelisted(tg_id: int) -> bool:
-    return tg_id in WHITELIST_USERS
+def is_whitelisted(uid: int) -> bool:
+    return uid in WHITELIST_USERS
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
