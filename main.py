@@ -39,11 +39,10 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
 USERS_DB_PATH = os.getenv("USERS_DB_PATH", "users_limits.json")
 ANALYTICS_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics_events.jsonl")
 
-# Google Sheets
+# --- Google Sheets ENV ---
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON одной строкой
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 SHEETS_WORKSHEET = os.getenv("SHEETS_WORKSHEET", "Events")
-# поддерживаем два имени переменной для ключа
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 # Белый список (VIP) — пользователи без лимитов
 # Можно задавать через ENV WHITELIST_USERS="557891018,1942344627"
@@ -274,30 +273,31 @@ _sheets_ws = None
 
 def _ts() -> str: return datetime.utcnow().isoformat()
 
+_sheets_client = None
+_sheets_ws = None
+
 def _init_sheets():
-    """
-    Инициализация клиента Google Sheets.
-    Читает JSON-ключ из GOOGLE_CREDENTIALS (или GOOGLE_SERVICE_ACCOUNT_JSON),
-    логирует email сервис-аккаунта и подключает лист.
-    """
     global _sheets_client, _sheets_ws
-    if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID):
-        logging.info("Sheets: env not set; skip (GOOGLE_CREDENTIALS or SHEETS_SPREADSHEET_ID missing)")
+
+    if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and SHEETS_WORKSHEET):
+        logging.error("Sheets env not set: GOOGLE_CREDENTIALS / SHEETS_SPREADSHEET_ID / SHEETS_WORKSHEET")
+        return
+
+    # 2.1 Парсим JSON и чётко логируем, если что-то не так
+    try:
+        creds_info = json.loads(GOOGLE_CREDENTIALS)
+        # sanity-check
+        assert "client_email" in creds_info and "private_key" in creds_info
+    except Exception:
+        logging.exception("Sheets creds JSON parse failed")
         return
 
     try:
-        # JSON может быть с переносами или в одну строку — json.loads справится
-        creds_info = json.loads(GOOGLE_CREDENTIALS)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-
-        # Логируем email сервис-аккаунта для проверки доступа
-        svc_email = creds_info.get("client_email", "<unknown>")
-        logging.info("Sheets: using service account %s", svc_email)
-
         _sheets_client = gspread.authorize(creds)
-        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
 
+        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
         try:
             _sheets_ws = sh.worksheet(SHEETS_WORKSHEET)
         except gspread.WorksheetNotFound:
@@ -306,8 +306,7 @@ def _init_sheets():
                 ["ts","user_id","event","topic","live","time_sensitive","mode","extra"],
                 value_input_option="RAW"
             )
-
-        logging.info("Sheets connected to %s/%s", SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET)
+        logging.info("Sheets OK: spreadsheet=%s worksheet=%s", SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET)
     except Exception:
         logging.exception("Sheets init failed")
         _sheets_client = _sheets_ws = None
