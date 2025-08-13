@@ -569,6 +569,42 @@ async def cmd_gs_try(message: Message):
         logging.exception("gs_try failed")
         await message.answer(f"❌ gs_try ошибка: {e}")
 
+@dp.message(Command("gs_reinit"))
+async def cmd_gs_reinit(message: Message):
+    # Переподключаемся к Sheets и возвращаем человеку явную причину падения
+    try:
+        # тот же код, что в _init_sheets, но с detailed reply
+        if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and SHEETS_WORKSHEET):
+            return await message.answer("❌ ENV не заданы: GOOGLE_CREDENTIALS / SHEETS_SPREADSHEET_ID / SHEETS_WORKSHEET")
+
+        import json as _json
+        from google.oauth2.service_account import Credentials as _Creds
+        import gspread as _gsp
+
+        creds_info = _json.loads(GOOGLE_CREDENTIALS)  # если тут упадёт — формат JSON неверный
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = _Creds.from_service_account_info(creds_info, scopes=scopes)
+
+        global _sheets_client, _sheets_ws
+        _sheets_client = _gsp.authorize(creds)
+
+        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        # пробуем открыть нужный лист, если нет — создаём
+        try:
+            _sheets_ws = sh.worksheet(SHEETS_WORKSHEET)
+        except _gsp.WorksheetNotFound:
+            _sheets_ws = sh.add_worksheet(title=SHEETS_WORKSHEET, rows=2000, cols=20)
+            _sheets_ws.append_row(["ts","user_id","event","topic","live","time_sensitive","mode","extra"], value_input_option="RAW")
+
+        await message.answer(f"✅ Sheets reinit OK. Лист: '{_sheets_ws.title}'")
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc(limit=2)
+        await message.answer(f"❌ gs_reinit ошибка: {e}\n\n{tb}")
+
 # ============== CALLBACKS ==============
 @dp.callback_query(F.data=="show_tariffs")
 async def cb_show_tariffs(call: CallbackQuery):
