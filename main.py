@@ -33,7 +33,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # если нет — фолбек
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # например "123456789"
 
 # Персистентное хранилище пользователей
-USERS_DB_PATH = os.getenv("USERS_DB_PATH", "data/users.json")
+USERS_DB_PATH = os.getenv("USERS_DB_PATH", "users_limits.json")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -414,7 +414,8 @@ async def cb_subscribe_start(call: CallbackQuery):
         [InlineKeyboardButton(text="✅ Готово (я оплатил)", callback_data="paid_start_done")]
     ])
     await call.message.answer(
-        f"💳 «Старт» — {TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}", reply_markup=kb
+        f"💳 «Старт» — {TARIFFS['start']['price_узs'] if 'price_узs' in TARIFFS['start'] else TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}",
+        reply_markup=kb
     )
     await call.answer()
 
@@ -444,7 +445,7 @@ async def cb_topic(call: CallbackQuery):
         u["topic"] = key
         save_users()
         lang = u["lang"]
-        title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
+        title = TOPICS[key]["title_уз"] if "title_уз" in TOPICS[key] else (TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"])
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
         await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
 
