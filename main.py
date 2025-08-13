@@ -535,6 +535,40 @@ async def cmd_gs_debug(message: Message):
     ]
     await message.answer("\n".join(msg))
 
+@dp.message(Command("gs_list"))
+async def cmd_gs_list(message: Message):
+    try:
+        if not _sheets_client:
+            return await message.answer("❌ Sheets client не инициализирован. Перезапусти после правок.")
+        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        titles = [ws.title for ws in sh.worksheets()]
+        await message.answer("Листы в таблице:\n" + "\n".join("• " + t for t in titles))
+    except Exception as e:
+        logging.exception("gs_list failed")
+        await message.answer(f"❌ gs_list ошибка: {e}")
+
+@dp.message(Command("gs_try"))
+async def cmd_gs_try(message: Message):
+    """
+    Пишем строку «в обход» текущего ws:
+    - если указанного листа нет, берём первый лист книги
+    - пытаемся записать туда
+    """
+    try:
+        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(SHEETS_WORKSHEET)
+        except gspread.WorksheetNotFound:
+            ws = sh.sheet1  # первый лист
+        ws.append_row(
+            [datetime.utcnow().isoformat(), str(message.from_user.id), "gs_try", "", "0", "0", "manual", "{}"],
+            value_input_option="RAW"
+        )
+        await message.answer(f"✅ Записал строку в лист '{ws.title}'.")
+    except Exception as e:
+        logging.exception("gs_try failed")
+        await message.answer(f"❌ gs_try ошибка: {e}")
+
 # ============== CALLBACKS ==============
 @dp.callback_query(F.data=="show_tariffs")
 async def cb_show_tariffs(call: CallbackQuery):
