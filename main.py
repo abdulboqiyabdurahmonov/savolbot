@@ -42,7 +42,8 @@ ANALYTICS_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics_events.jsonl")
 # Google Sheets
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 SHEETS_WORKSHEET = os.getenv("SHEETS_WORKSHEET", "Events")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+# поддерживаем два имени переменной для ключа
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 # Whitelist (безлимит для указанных юзеров)
 WHITELIST_USERS = set(
@@ -271,28 +272,42 @@ _sheets_ws = None
 def _ts() -> str: return datetime.utcnow().isoformat()
 
 def _init_sheets():
+    """
+    Инициализация клиента Google Sheets.
+    Читает JSON-ключ из GOOGLE_CREDENTIALS (или GOOGLE_SERVICE_ACCOUNT_JSON),
+    логирует email сервис-аккаунта и подключает лист.
+    """
     global _sheets_client, _sheets_ws
-    if not (GOOGLE_SERVICE_ACCOUNT_JSON and SHEETS_SPREADSHEET_ID):
-        logging.info("Sheets: env not set; skip")
+    if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID):
+        logging.info("Sheets: env not set; skip (GOOGLE_CREDENTIALS or SHEETS_SPREADSHEET_ID missing)")
         return
+
     try:
-        creds_info=json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        creds=Credentials.from_service_account_info(creds_info, scopes=scopes)
-        _sheets_client=gspread.authorize(creds)
-        sh=_sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        # JSON может быть с переносами или в одну строку — json.loads справится
+        creds_info = json.loads(GOOGLE_CREDENTIALS)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+
+        # Логируем email сервис-аккаунта для проверки доступа
+        svc_email = creds_info.get("client_email", "<unknown>")
+        logging.info("Sheets: using service account %s", svc_email)
+
+        _sheets_client = gspread.authorize(creds)
+        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+
         try:
-            _sheets_ws=sh.worksheet(SHEETS_WORKSHEET)
+            _sheets_ws = sh.worksheet(SHEETS_WORKSHEET)
         except gspread.WorksheetNotFound:
-            _sheets_ws=sh.add_worksheet(title=SHEETS_WORKSHEET, rows=2000, cols=20)
+            _sheets_ws = sh.add_worksheet(title=SHEETS_WORKSHEET, rows=2000, cols=20)
             _sheets_ws.append_row(
                 ["ts","user_id","event","topic","live","time_sensitive","mode","extra"],
                 value_input_option="RAW"
             )
+
         logging.info("Sheets connected to %s/%s", SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET)
     except Exception:
         logging.exception("Sheets init failed")
-        _sheets_client=_sheets_ws=None
+        _sheets_client = _sheets_ws = None
 
 def _sheets_append(row: dict):
     if not _sheets_ws: return
@@ -443,6 +458,28 @@ async def cmd_stats(message: Message):
     parts=message.text.strip().split()
     days=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else 7
     await message.answer(format_stats(days))
+
+@dp.message(Command("gs_test"))
+async def cmd_gs_test(message: Message):
+    if ADMIN_CHAT_ID and str(message.from_user.id) != str(ADMIN_CHAT_ID):
+        return await message.answer("Команда доступна администратору.")
+
+    try:
+        if _sheets_ws is None:
+            return await message.answer(
+                "❌ Sheets не инициализирован. "
+                "Проверь ENV: GOOGLE_CREDENTIALS, SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET. "
+                "См. логи: 'Sheets init failed' или 'env not set'."
+            )
+
+        _sheets_ws.append_row(
+            [datetime.utcnow().isoformat(), str(message.from_user.id), "gs_test", "", "0", "0", "manual", "{}"],
+            value_input_option="RAW"
+        )
+        await message.answer(f"✅ Google Sheets OK: запись в '{SHEETS_WORKSHEET}' прошла успешно.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка записи в Google Sheets: {e}\n"
+                             f"Проверь доступ сервис-аккаунта к таблице и корректность GOOGLE_CREDENTIALS.")
 
 # ============== CALLBACKS ==============
 @dp.callback_query(F.data=="show_tariffs")
