@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 
 import httpx
@@ -151,18 +152,41 @@ async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
         return r.json()["choices"][0]["message"]["content"].strip()
 
 # ---- Live-поиск ----
-# расширили детектор: текущее время + должности/персоны
 TIME_SENSITIVE_PATTERNS = [
     r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
     r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
     r"\b(bugun|hozir|narx|kurs|yangilik)\b",
     r"\b(кто|как зовут|фамилия|председател[ья]?|директор|гендиректор|ceo|chairman|руководител[ья]?)\b",
-    r"\b(банк|акб|ооо|ао|компания|министерств[оа])\b.*",  # «кто руководитель банка/компании...»
+    r"\b(банк|акб|ооо|ао|компания|министерств[оа])\b.*",
 ]
-
 def is_time_sensitive(q: str) -> bool:
     t = q.lower()
     return any(re.search(rx, t) for rx in TIME_SENSITIVE_PATTERNS)
+
+# ====== КЭШ ДЛЯ LIVE-ПОИСКА ======
+CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))  # 24 часа по умолчанию
+CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
+LIVE_CACHE: dict[str, dict] = {}  # key -> {"ts": float, "answer": str}
+
+def _norm_query(q: str) -> str:
+    return re.sub(r"\s+", " ", q.strip().lower())
+
+def cache_get(q: str) -> str | None:
+    k = _norm_query(q)
+    item = LIVE_CACHE.get(k)
+    if not item:
+        return None
+    if time.time() - item["ts"] > CACHE_TTL_SECONDS:
+        LIVE_CACHE.pop(k, None)
+        return None
+    return item["answer"]
+
+def cache_set(q: str, answer: str):
+    # простейшее ограничение размера: выкидываем самый старый
+    if len(LIVE_CACHE) >= CACHE_MAX_ENTRIES:
+        oldest_key = min(LIVE_CACHE, key=lambda kk: LIVE_CACHE[kk]["ts"])
+        LIVE_CACHE.pop(oldest_key, None)
+    LIVE_CACHE[_norm_query(q)] = {"ts": time.time(), "answer": answer}
 
 async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
     if not TAVILY_API_KEY:
@@ -181,6 +205,12 @@ async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
         return r.json()
 
 async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str:
+    # 1) пытаемся взять из кэша финальный ответ
+    cached = cache_get(user_text)
+    if cached:
+        return cached + "\n\n(из кэша за последние 24 часа)"
+
+    # 2) иначе — реальный поиск
     data = await web_search_tavily(user_text)
     if not data:
         return await ask_gpt(user_text, topic_hint)
@@ -208,7 +238,11 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str
         answer = r.json()["choices"][0]["message"]["content"].strip()
 
     tail = "\n\nИсточники:\n" + "\n".join(sources_for_user)
-    return answer + tail
+    final_answer = answer + tail
+
+    # 3) кладём в кэш
+    cache_set(user_text, final_answer)
+    return final_answer
 
 # ================== КОМАНДЫ ==================
 @dp.message(Command("start"))
@@ -229,8 +263,8 @@ async def cmd_help(message: Message):
         "1) Пишите вопрос (RU/UZ). Язык ответа = язык вопроса.\n"
         "2) /topics — выберите тему для более точных ответов.\n"
         "3) Первые 2 ответа — бесплатно; дальше /tariffs.\n"
-        "4) /live_on — включить интернет-поиск для всех ваших вопросов, /live_off — выключить.\n"
-        "5) Для разового запроса можно: /asklive вопрос."
+        "4) /live_on — включить интернет-поиск; /live_off — выключить.\n"
+        "5) /asklive вопрос — разовый live-поиск."
     )
 
 @dp.message(Command("about"))
@@ -294,6 +328,21 @@ async def cmd_live_off(message: Message):
     u = get_user(message.from_user.id)
     u["live"] = False
     await message.answer("⏹ Live-поиск выключён. Вернулись к обычным ответам модели.")
+
+# ---- cache utils ----
+@dp.message(Command("cache_info"))
+async def cmd_cache_info(message: Message):
+    # доступ открыт всем — это harmless; если хочешь, можно ограничить админом
+    size = len(LIVE_CACHE)
+    ttl_h = round(CACHE_TTL_SECONDS / 3600, 1)
+    await message.answer(f"🗄 Кэш live-поиска: {size} записей, TTL ≈ {ttl_h} ч., max {CACHE_MAX_ENTRIES}")
+
+@dp.message(Command("cache_clear"))
+async def cmd_cache_clear(message: Message):
+    if ADMIN_CHAT_ID and str(message.from_user.id) != str(ADMIN_CHAT_ID):
+        return await message.answer("Команда доступна администратору.")
+    LIVE_CACHE.clear()
+    await message.answer("🧹 Кэш live-поиска очищен.")
 
 # ================== CALLBACKS ==================
 @dp.callback_query(F.data == "show_tariffs")
@@ -410,7 +459,7 @@ async def on_startup():
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-                json={"url": WEBHOOK_URL, "secret_token": {WEBHOOK_SECRET}}
+                json={"url": WEBHOOK_URL, "secret_token": WEBHOOK_SECRET}
             )
             logging.info("setWebhook: %s %s", resp.status_code, resp.text)
 
