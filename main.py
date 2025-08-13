@@ -29,8 +29,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # для live-поиска (по желанию)
+# Live-поиск (через Tavily REST)
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
+# Админ
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
 
 # Персистентные файлы
@@ -41,6 +43,14 @@ ANALYTICS_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics_events.jsonl")
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 SHEETS_WORKSHEET = os.getenv("SHEETS_WORKSHEET", "Events")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+# Whitelist (безлимит для указанных юзеров)
+WHITELIST_USERS = set(
+    int(x) for x in os.getenv("WHITELIST_USERS", "557891018").split(",") if x.strip().isdigit()
+)
+
+def is_whitelisted(tg_id: int) -> bool:
+    return tg_id in WHITELIST_USERS
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -215,7 +225,7 @@ CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
 LIVE_CACHE: dict[str, dict] = {}
 
 def _norm_query(q: str) -> str: return re.sub(r"\s+", " ", q.strip().lower())
-def cache_get(q: str): 
+def cache_get(q: str):
     k=_norm_query(q); it=LIVE_CACHE.get(k)
     if not it: return None
     if time.time()-it["ts"]>CACHE_TTL_SECONDS: LIVE_CACHE.pop(k,None); return None
@@ -316,7 +326,6 @@ def log_event(user_id: int, name: str, **payload):
     _sheets_append(row)
 
 def format_stats(days: int | None = 7):
-    # лёгкая сводка по файлу (Sheets для просмотра в UI)
     p=Path(ANALYTICS_DB_PATH)
     if not p.exists(): return "Пока нет событий."
     cutoff = datetime.utcnow()-timedelta(days=days) if days else None
@@ -331,7 +340,6 @@ def format_stats(days: int | None = 7):
         except Exception:
             continue
     total=len(evs); users=len({e["user_id"] for e in evs})
-    per=Counter(e["event"] for e in evs)
     qs=[e for e in evs if e["event"]=="question"]
     topics=Counter((e.get("topic") or "—") for e in qs)
     grants=sum(1 for e in evs if e["event"]=="subscription_granted")
@@ -341,7 +349,7 @@ def format_stats(days: int | None = 7):
         f"📊 Статистика за {days} дн.",
         f"• Событий: {total} | Уник. пользователей: {users}",
         f"• Вопросов: {len(qs)} | Live-использований: {sum(1 for e in qs if e.get('live'))}",
-        f"• Топ тем: "+", ".join(f"{k}:{v}" for k,v in topics.most_common(6)) if topics else "• Топ тем: —",
+        f"• Топ тем: "+(", ".join(f"{k}:{v}" for k,v in topics.most_common(6)) if topics else "—"),
         f"• Кнопка «Оплатил»: {paid_clicks} | Активаций подписки: {grants}",
         f"• Активных подписок сейчас: {active_now}"
     ]
@@ -373,7 +381,7 @@ async def cmd_about(message: Message):
     log_event(message.from_user.id,"about")
     await message.answer("🤖 SavolBot от TripleA. В рамках закона РУз. Поддержать проект — /tariffs.")
 
-@dp.message(Command("tariffs")))
+@dp.message(Command("tariffs"))
 async def cmd_tariffs(message: Message):
     u=get_user(message.from_user.id); log_event(message.from_user.id,"view_tariffs")
     await message.answer(tariffs_text(u["lang"]), reply_markup=pay_kb())
@@ -384,8 +392,16 @@ async def cmd_myplan(message: Message):
     status="активна" if has_active_sub(u) else "нет"
     until=u["paid_until"].isoformat() if u["paid_until"] else "—"
     topic=u.get("topic") or "—"; live="вкл" if u.get("live") else "выкл"
-    log_event(message.from_user.id,"myplan_open")
-    await message.answer(f"Ваш план: {u['plan']} | Live: {live}\nПодписка: {status} (до {until})\nТема: {topic}\nБесплатно: {u['free_used']}/{FREE_LIMIT}")
+    is_wl = is_whitelisted(message.from_user.id)
+    plan_label = "whitelist (безлимит)" if is_wl else u["plan"]
+    free_info = "безлимит" if is_wl else f"{u['free_used']}/{FREE_LIMIT}"
+    log_event(message.from_user.id,"myplan_open", whitelisted=is_wl)
+    await message.answer(
+        f"Ваш план: {plan_label} | Live: {live}\n"
+        f"Подписка: {status} (до {until})\n"
+        f"Тема: {topic}\n"
+        f"Бесплатно: {free_info}"
+    )
 
 @dp.message(Command("topics"))
 async def cmd_topics(message: Message):
@@ -397,15 +413,18 @@ async def cmd_topics(message: Message):
 async def cmd_asklive(message: Message):
     u=get_user(message.from_user.id); q=message.text.replace("/asklive","",1).strip()
     if not q: return await message.answer("Напишите так: /asklive ваш вопрос")
-    if not has_active_sub(u) and u["free_used"]>=FREE_LIMIT:
-        log_event(message.from_user.id,"paywall_shown"); return await message.answer("💳 Доступ ограничен. Оформите подписку:", reply_markup=pay_kb())
+    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)) and u["free_used"]>=FREE_LIMIT:
+        log_event(message.from_user.id,"paywall_shown"); 
+        return await message.answer("💳 Доступ ограничен. Оформите подписку:", reply_markup=pay_kb())
     topic_hint = TOPICS.get(u.get("topic"),{}).get("hint")
     try:
         reply=await answer_with_live_search(q, topic_hint); await message.answer(reply)
-        log_event(message.from_user.id,"question",mode="asklive",topic=u.get("topic"),live=True,time_sensitive=True)
+        log_event(message.from_user.id,"question",mode="asklive",topic=u.get("topic"),live=True,time_sensitive=True,
+                  whitelisted=is_whitelisted(message.from_user.id))
     except Exception:
         logging.exception("Live error"); return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
-    if not has_active_sub(u): u["free_used"]+=1; save_users()
+    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)):
+        u["free_used"]+=1; save_users()
 
 @dp.message(Command("live_on"))
 async def cmd_live_on(message: Message):
@@ -482,7 +501,7 @@ async def handle_text(message: Message):
     if violates_policy(text):
         log_event(message.from_user.id,"question_blocked",reason="policy")
         return await message.answer(DENY_TEXT_UZ if u["lang"]=="uz" else DENY_TEXT_RU)
-    if not has_active_sub(u) and u["free_used"]>=FREE_LIMIT:
+    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)) and u["free_used"]>=FREE_LIMIT:
         log_event(message.from_user.id,"paywall_shown")
         return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
     topic_hint = TOPICS.get(u.get("topic"),{}).get("hint")
@@ -490,10 +509,12 @@ async def handle_text(message: Message):
     try:
         reply = await (answer_with_live_search(text, topic_hint) if use_live else ask_gpt(text, topic_hint))
         await message.answer(reply)
-        log_event(message.from_user.id,"question",topic=u.get("topic"),live=use_live,time_sensitive=time_sens)
+        log_event(message.from_user.id,"question",topic=u.get("topic"),live=use_live,time_sensitive=time_sens,
+                  whitelisted=is_whitelisted(message.from_user.id))
     except Exception:
         logging.exception("OpenAI error"); return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
-    if not has_active_sub(u): u["free_used"]+=1; save_users()
+    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)):
+        u["free_used"]+=1; save_users()
 
 # ============== WEBHOOK/STARTUP ==============
 @app.post("/webhook")
