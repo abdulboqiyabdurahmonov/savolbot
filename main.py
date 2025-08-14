@@ -74,8 +74,16 @@ async def lifespan(app: FastAPI):
 
     # Глобальные клиенты
     global client_openai, client_http
-    client_openai = httpx.AsyncClient(base_url=OPENAI_API_BASE, timeout=HTTPX_TIMEOUT, http2=True)
-    client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=True)
+    # Опциональный HTTP/2: включается только если есть пакет h2 и переменная окружения HTTP2_ENABLED=1
+HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "0") == "1"
+try:
+    import h2  # type: ignore
+    _h2_ok = True
+except Exception:
+    _h2_ok = False
+use_http2 = HTTP2_ENABLED and _h2_ok
+client_openai = httpx.AsyncClient(base_url=OPENAI_API_BASE, timeout=HTTPX_TIMEOUT, http2=use_http2)
+client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=use_http2)
 
     # webhook проставим на старте
     if TELEGRAM_TOKEN and WEBHOOK_URL:
@@ -337,7 +345,17 @@ def _init_sheets():
             creds_text = raw
 
         creds_info = json.loads(creds_text)
-        scopes = [
+# Нормализуем private_key из ENV (часто хранится с литеральными \n)
+if isinstance(creds_info, dict) and "private_key" in creds_info and creds_info.get("private_key"):
+    pk = creds_info["private_key"]
+    if "BEGIN PRIVATE KEY" not in pk:
+        creds_info["private_key"] = pk.replace("\n", "
+")
+# Базовая валидация, чтобы ловить ошибки конфигурации раньше
+for field in ("client_email", "private_key"):
+    if not creds_info.get(field):
+        raise ValueError(f"GOOGLE_CREDENTIALS is missing '{field}'")
+scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
