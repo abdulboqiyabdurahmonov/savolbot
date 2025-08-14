@@ -104,6 +104,25 @@ def violates_policy(text: str) -> bool:
     t = text.lower()
     return any(re.search(rx, t) for rx in ILLEGAL_PATTERNS)
 
+# ============== АНТИССЫЛКИ (очистка ссылок из ответов) ==============
+LINK_PAT = re.compile(r'https?://\S+')
+MD_LINK_PAT = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+)\)')
+SOURCES_BLOCK_PAT = re.compile(r'(?is)\n+источники:\s*.*$')
+
+def strip_links(text: str) -> str:
+    if not text:
+        return text
+    # 1) [текст](url) -> "текст"
+    text = MD_LINK_PAT.sub(r'\1', text)
+    # 2) голые url -> удаляем
+    text = LINK_PAT.sub('', text)
+    # 3) блок "Источники: ..." до конца -> удалить
+    text = SOURCES_BLOCK_PAT.sub('', text)
+    # 4) подчистить лишние пробелы/пустые строки
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return text
+
 # ============== ТАРИФЫ/ЛИМИТЫ ==============
 FREE_LIMIT = 2
 TARIFFS = {
@@ -219,7 +238,8 @@ def tariffs_text(lang='ru'):
 BASE_SYSTEM_PROMPT = (
     "Ты — SavolBot, дружелюбный консультант. Отвечай кратко и ясно (до 6–8 предложений). "
     "Соблюдай законы Узбекистана. Не давай инструкции по незаконным действиям, подделкам, взломам, обходу систем. "
-    "По медицине — только общая справка и совет обратиться к врачу. Язык ответа = язык вопроса (RU/UZ)."
+    "По медицине — только общая справка и совет обратиться к врачу. Язык ответа = язык вопроса (RU/UZ). "
+    "Никогда не вставляй ссылки и URL в ответ."
 )
 
 async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
@@ -233,7 +253,8 @@ async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
     async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
         r = await client.post("/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        return strip_links(raw)
 
 # ============== LIVE SEARCH ==============
 TIME_SENSITIVE_PATTERNS = [
@@ -285,17 +306,19 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str
     data = await web_search_tavily(user_text)
     if not data:
         return await ask_gpt(user_text, topic_hint)
-    snippets = []; sources = []
+
+    # Сниппеты только текстовые — без URL
+    snippets = []
     for it in (data.get("results") or [])[:5]:
         title = (it.get("title") or "")[:120]
-        url = it.get("url") or ""
         content = (it.get("content") or "")[:500]
-        snippets.append(f"- {title}\n{content}\nИсточник: {url}")
-        sources.append(f"• {title} — {url}")
-    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники. Кратко, по делу."
+        snippets.append(f"- {title}\n{content}")
+
+    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
     if topic_hint:
         system += f" Учитывай контекст темы: {topic_hint}"
-    user_aug = f"{user_text}\n\nИСТОЧНИКИ:\n" + "\n\n".join(snippets)
+    user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
+
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
         "model": OPENAI_MODEL,
@@ -306,7 +329,8 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None) -> str
         r = await client.post("/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
         answer = r.json()["choices"][0]["message"]["content"].strip()
-    final = answer + "\n\nИсточники:\n" + "\n".join(sources)
+
+    final = strip_links(answer)
     cache_set(user_text, final)
     return final
 
