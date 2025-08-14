@@ -145,7 +145,11 @@ DENY_TEXT_UZ = "⛔ So‘rov rad etildi. Men faqat O‘zbekiston qonunchiligi do
 
 def is_uzbek(text: str) -> bool:
     t = text.lower()
-    return bool(re.search(r"[ғқҳў]", t) or re.search(r"\b(ha|yo'q|iltimos|rahmat|salom)\b", t))
+    # поддерживаем и прямой апостроф ' и типографский ’
+    return bool(
+        re.search(r"[ғқҳў]", t) or
+        re.search(r"\b(ha|yo[’']q|iltimos|rahmat|salom)\b", t)
+    )
 
 def violates_policy(text: str) -> bool:
     t = text.lower()
