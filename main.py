@@ -231,6 +231,61 @@ def tariffs_text(lang='ru'):
             txt.append(f"⭐ {t['title']} {badge}\nЦена: {t['price_uzs']:,} сум/мес\n{bullet(t['desc'])}")
     return "\n\n".join(txt)
 
+# ============== ИСТОРИЯ ДИАЛОГА ==============
+HISTORY: dict[int, list[dict]] = {}  # {user_id: [ {role:"user"/"assistant", content:str, ts:str}, ... ]}
+
+def _hist_path() -> Path:
+    p = Path(HISTORY_DB_PATH); p.parent.mkdir(parents=True, exist_ok=True); return p
+
+def load_history():
+    global HISTORY
+    p = _hist_path()
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text("utf-8"))
+            HISTORY = {int(k): v for k, v in raw.items()}
+        except Exception:
+            logging.exception("load_history failed")
+            HISTORY = {}
+    else:
+        HISTORY = {}
+
+def save_history():
+    try:
+        _hist_path().write_text(json.dumps({str(k): v for k, v in HISTORY.items()}, ensure_ascii=False, indent=2), "utf-8")
+    except Exception:
+        logging.exception("save_history failed")
+
+def reset_history(user_id: int):
+    HISTORY.pop(user_id, None)
+    save_history()
+
+def append_history(user_id: int, role: str, content: str):
+    lst = HISTORY.setdefault(user_id, [])
+    lst.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
+    # удерживаем размер окна (последние 10 пар «вопрос-ответ» ~ 20 сообщений)
+    if len(lst) > 20:
+        del lst[: len(lst) - 20]
+    save_history()
+
+def get_recent_history(user_id: int, max_chars: int = 6000) -> list[dict]:
+    """Возвращает последние реплики без SYSTEM, чтобы вставить перед текущим вопросом."""
+    lst = HISTORY.get(user_id, [])
+    # ограничим по суммарной длине символов
+    total = 0; picked = []
+    for item in reversed(lst):
+        c = item.get("content") or ""
+        total += len(c)
+        if total > max_chars: break
+        picked.append({"role": item.get("role"), "content": c})
+    return list(reversed(picked))
+
+def build_messages(user_id: int, system: str, user_text: str) -> list[dict]:
+    msgs = [{"role": "system", "content": system}]
+    msgs.extend(get_recent_history(user_id))
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
 # ============== ИИ ==============
 BASE_SYSTEM_PROMPT = (
     "Ты — SavolBot, дружелюбный консультант. Отвечай кратко и ясно (до 6–8 предложений). "
@@ -240,19 +295,48 @@ BASE_SYSTEM_PROMPT = (
     "Не упоминай дату отсечки знаний модели. Если нужна актуальность — отвечай по фактам из поиска."
 )
 
-async def ask_gpt(user_text: str, topic_hint: str | None) -> str:
-    if not OPENAI_API_KEY:
-        return f"Вы спросили: {user_text}"
-    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {"model": OPENAI_MODEL, "temperature": 0.6,
-               "messages": [{"role": "system", "content": system},
-                            {"role": "user", "content": user_text}]}
-    async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
-        r = await client.post("/chat/completions", headers=headers, json=payload)
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"].strip()
-        return strip_links(raw)
+async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
+    ...
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.6,
+        "messages": build_messages(user_id, system, user_text)  # <-- вместо messages=[...]
+    }
+    ...
+    raw = r.json()["choices"][0]["message"]["content"].strip()
+    return strip_links(raw)
+
+async def answer_with_live_search(user_text: str, topic_hint: str | None, user_id: int) -> str:
+    c = cache_get(user_text)
+    if c:
+        return c + "\n\n(из кэша за последние 24 часа)"
+
+    data = await web_search_tavily(user_text)
+    if not data:
+        return await ask_gpt(user_text, topic_hint, user_id)
+
+    snippets = []
+    for it in (data.get("results") or [])[:5]:
+        title = (it.get("title") or "")[:120]
+        content = (it.get("content") or "")[:500]
+        snippets.append(f"- {title}\n{content}")
+
+    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
+    if topic_hint:
+        system += f" Учитывай контекст темы: {topic_hint}"
+
+    user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.4,
+        "messages": build_messages(user_id, system, user_aug)  # <-- история + user_aug
+    }
+    ...
+    answer = r.json()["choices"][0]["message"]["content"].strip()
+    final = strip_links(answer)
+    cache_set(user_text, final)
+    return final
 
 # ============== LIVE SEARCH ==============
 TIME_SENSITIVE_PATTERNS = [
