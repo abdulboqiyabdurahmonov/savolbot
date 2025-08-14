@@ -63,6 +63,7 @@ dp = Dispatcher()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_users()
+    load_history()
     _init_sheets()
     # webhook проставим на старте
     if TELEGRAM_TOKEN and WEBHOOK_URL:
@@ -232,6 +233,7 @@ def tariffs_text(lang='ru'):
     return "\n\n".join(txt)
 
 # ============== ИСТОРИЯ ДИАЛОГА ==============
+HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "chat_history.json")
 HISTORY: dict[int, list[dict]] = {}  # {user_id: [ {role:"user"/"assistant", content:str, ts:str}, ... ]}
 
 def _hist_path() -> Path:
@@ -242,11 +244,9 @@ def load_history():
     p = _hist_path()
     if p.exists():
         try:
-            raw = json.loads(p.read_text("utf-8"))
-            HISTORY = {int(k): v for k, v in raw.items()}
+            HISTORY = {int(k): v for k, v in json.loads(p.read_text("utf-8")).items()}
         except Exception:
-            logging.exception("load_history failed")
-            HISTORY = {}
+            logging.exception("load_history failed"); HISTORY = {}
     else:
         HISTORY = {}
 
@@ -257,27 +257,22 @@ def save_history():
         logging.exception("save_history failed")
 
 def reset_history(user_id: int):
-    HISTORY.pop(user_id, None)
-    save_history()
+    HISTORY.pop(user_id, None); save_history()
 
 def append_history(user_id: int, role: str, content: str):
     lst = HISTORY.setdefault(user_id, [])
     lst.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
-    # удерживаем размер окна (последние 10 пар «вопрос-ответ» ~ 20 сообщений)
-    if len(lst) > 20:
+    if len(lst) > 20:          # окно (~10 последних обменов)
         del lst[: len(lst) - 20]
     save_history()
 
 def get_recent_history(user_id: int, max_chars: int = 6000) -> list[dict]:
-    """Возвращает последние реплики без SYSTEM, чтобы вставить перед текущим вопросом."""
-    lst = HISTORY.get(user_id, [])
-    # ограничим по суммарной длине символов
     total = 0; picked = []
-    for item in reversed(lst):
+    for item in reversed(HISTORY.get(user_id, [])):
         c = item.get("content") or ""
         total += len(c)
         if total > max_chars: break
-        picked.append({"role": item.get("role"), "content": c})
+        picked.append({"role": item["role"], "content": c})
     return list(reversed(picked))
 
 def build_messages(user_id: int, system: str, user_text: str) -> list[dict]:
