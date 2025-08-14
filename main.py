@@ -358,7 +358,6 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None, user_i
     if not data:
         return await ask_gpt(user_text, topic_hint, user_id)
 
-    # Сниппеты только текстовые — без URL
     snippets = []
     for it in (data.get("results") or [])[:5]:
         title = (it.get("title") or "")[:120]
