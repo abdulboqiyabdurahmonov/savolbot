@@ -875,14 +875,6 @@ async def handle_text(message: Message):
     text = message.text.strip()
     uid = message.from_user.id
     u = get_user(uid)
-    
-    # Если пользователь просит «вспомнить», отвечаем сами из истории
-if any(re.search(rx, text.lower()) for rx in RECALL_PATTERNS):
-    recap = quick_recap(uid)
-    await message.answer(recap)
-    append_history(uid, "user", text)
-    append_history(uid, "assistant", recap)
-    return  
 
     if is_uzbek(text):
         u["lang"] = "uz"; save_users()
@@ -893,13 +885,22 @@ if any(re.search(rx, text.lower()) for rx in RECALL_PATTERNS):
         log_event(uid, "paywall_shown")
         return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
 
+    # ⬇️ ВСТАВКА: перехват «вспомни»-вопросов
+    if any(re.search(rx, text.lower()) for rx in RECALL_PATTERNS):
+        recap = quick_recap(uid)
+        await message.answer(recap)
+        append_history(uid, "user", text)
+        append_history(uid, "assistant", recap)
+        return
+    # ⬆️ Конец вставки
+
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    # всегда через Live Search (для скорости можно заменить на: is_time_sensitive(text))
-    use_live = True
+    use_live = True  # или is_time_sensitive(text)
 
     try:
         reply = await (answer_with_live_search(text, topic_hint, uid)
                        if use_live else ask_gpt(text, topic_hint, uid))
+        
         await message.answer(reply)
 
         append_history(uid, "user", text)
