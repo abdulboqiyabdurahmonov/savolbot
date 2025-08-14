@@ -15,6 +15,39 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, Update, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
+# --- Memory guard / recall helpers ---
+RECALL_PATTERNS = [
+    r"\b(помни(шь|те)|вспомни(шь|те))\b",
+    r"\b(что|о\s*чём|о\s*чем)\b.*\b(спрашивал|говорили|обсуждали)\b",
+    r"\b(вчера|сегодня)\b.*\b(диалог|разговор|чат)\b",
+]
+
+DISALLOWED_MEM_PHRASES = [
+    r"не могу вспомнить предыдущ(ие|ие) разговор(ы|а)",
+    r"я не сохраняю историю разговоров",
+    r"не\s*сохраня(ю|ем)\s*историю",
+    r"я не помню( наш)? предыдущ(ий|ие) разговор(ы)?",
+]
+
+def sanitize_answer(a: str) -> str:
+    txt = a or ""
+    low = txt.lower()
+    if any(re.search(rx, low) for rx in DISALLOWED_MEM_PHRASES):
+        return "Пока в контексте вижу только текущие сообщения. Напомни, пожалуйста, ключевые детали — и я подхвачу."
+    return txt
+
+def quick_recap(uid: int, n: int = 6) -> str:
+    msgs = HISTORY.get(uid, [])
+    if not msgs:
+        return "Пока в этом чате вижу только текущее сообщение. Напомни коротко, о чём речь — и продолжим."
+    lines = []
+    for m in msgs[-n:]:
+        role = "Ты" if m["role"] == "user" else "Я"
+        c = (m.get("content") or "").replace("\n", " ").strip()
+        if len(c) > 200: c = c[:200] + "…"
+        lines.append(f"• {role}: {c}")
+    return "Краткое напоминание последних сообщений:\n" + "\n".join(lines)
+
 # ---- Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
@@ -503,8 +536,8 @@ BASE_SYSTEM_PROMPT = (
     "По медицине — только общая справка и совет обратиться к врачу. Язык ответа = язык вопроса (RU/UZ). "
     "Никогда не вставляй ссылки и URL в ответ. "
     "Не упоминай дату отсечки знаний модели. Если нужна актуальность — отвечай по фактам из поиска. "
-    "Если в контексте переписки нет предыдущих сообщений — не говори, что «не сохраняешь историю». "
-    "Вежливо попроси собеседника коротко напомнить важные детали и продолжай."
+    "Никогда не пиши фразы вроде «я не помню/не сохраняю историю». "
+    "Если в контексте мало сообщений — вежливо попроси собеседника напомнить ключевые детали и продолжай."
 )
 
 async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
@@ -842,6 +875,14 @@ async def handle_text(message: Message):
     text = message.text.strip()
     uid = message.from_user.id
     u = get_user(uid)
+    
+    # Если пользователь просит «вспомнить», отвечаем сами из истории
+if any(re.search(rx, text.lower()) for rx in RECALL_PATTERNS):
+    recap = quick_recap(uid)
+    await message.answer(recap)
+    append_history(uid, "user", text)
+    append_history(uid, "assistant", recap)
+    return  
 
     if is_uzbek(text):
         u["lang"] = "uz"; save_users()
