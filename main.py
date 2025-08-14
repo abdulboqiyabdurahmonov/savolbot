@@ -291,15 +291,20 @@ BASE_SYSTEM_PROMPT = (
 )
 
 async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
-    ...
+    if not OPENAI_API_KEY:
+        return f"Вы спросили: {user_text}"
+    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.6,
-        "messages": build_messages(user_id, system, user_text)  # <-- вместо messages=[...]
+        "messages": build_messages(user_id, system, user_text)  # <—
     }
-    ...
-    raw = r.json()["choices"][0]["message"]["content"].strip()
-    return strip_links(raw)
+    async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
+        r = await client.post("/chat/completions", headers=headers, json=payload)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        return strip_links(raw)
 
 async def answer_with_live_search(user_text: str, topic_hint: str | None, user_id: int) -> str:
     c = cache_get(user_text)
@@ -319,16 +324,19 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None, user_i
     system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
     if topic_hint:
         system += f" Учитывай контекст темы: {topic_hint}"
-
     user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
 
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.4,
-        "messages": build_messages(user_id, system, user_aug)  # <-- история + user_aug
+        "messages": build_messages(user_id, system, user_aug)  # <—
     }
-    ...
-    answer = r.json()["choices"][0]["message"]["content"].strip()
+    async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
+        r = await client.post("/chat/completions", headers=headers, json=payload)
+        r.raise_for_status()
+        answer = r.json()["choices"][0]["message"]["content"].strip()
+
     final = strip_links(answer)
     cache_set(user_text, final)
     return final
