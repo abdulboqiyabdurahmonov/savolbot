@@ -687,7 +687,7 @@ async def handle_text(message: Message):
 
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
     time_sens = is_time_sensitive(text)
-    use_live = time_sens  # <— автоматический live только для актуальных вопросов
+    use_live = True  # 🔹 всегда включаем Live Search
 
     try:
         reply = await (answer_with_live_search(text, topic_hint) if use_live else ask_gpt(text, topic_hint))
