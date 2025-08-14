@@ -46,6 +46,11 @@ GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON одной стро
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 SHEETS_WORKSHEET = os.getenv("SHEETS_WORKSHEET", "Лист1")
 
+# --- HTTPX clients & timeouts (reuse) ---
+HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=15.0, pool=15.0)
+client_openai: httpx.AsyncClient | None = None
+client_http: httpx.AsyncClient | None = None
+
 # Белый список (VIP) — пользователи без лимитов
 WL_RAW = os.getenv("WHITELIST_USERS", "557891018,1942344627")
 try:
@@ -282,166 +287,38 @@ def save_history():
 def reset_history(user_id: int):
     HISTORY.pop(user_id, None); save_history()
 
-def append_history(user_id: int, role: str, content: str):
-    lst = HISTORY.setdefault(user_id, [])
-    lst.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
-    if len(lst) > 20:
-        del lst[: len(lst) - 20]
-    save_history()
-    # === пишем строку в Google Sheets ===
-    try:
-        ws = _history_ws()
-        if ws:
-            ws.append_row(
-                [datetime.utcnow().isoformat(), str(user_id), role, content],
-                value_input_option="RAW"
-            )
-    except Exception:
-        logging.exception("append_history: sheets write failed")
-
-def get_recent_history(user_id: int, max_chars: int = 6000) -> list[dict]:
-    if not HISTORY.get(user_id):  # локально пусто → пробуем загрузить из Sheets (последние 20)
-        try:
-            ws = _history_ws()
-            if ws:
-                rows = ws.get_all_values()  # [["ts","uid","role","content"], ...]
-                last = [r for r in rows[1:] if r[1] == str(user_id)][-20:]
-                HISTORY[user_id] = [{"role": r[2], "content": r[3], "ts": r[0]} for r in last]
-        except Exception:
-            logging.exception("get_recent_history: sheets read failed")
-    total = 0; picked = []
-    for item in reversed(HISTORY.get(user_id, [])):
-        c = item.get("content") or ""
-        total += len(c)
-        if total > max_chars: break
-        picked.append({"role": item["role"], "content": c})
-    return list(reversed(picked))
-
-def build_messages(user_id: int, system: str, user_text: str) -> list[dict]:
-    msgs = [{"role": "system", "content": system}]
-    msgs.extend(get_recent_history(user_id))
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
-
-# ============== ИИ ==============
-BASE_SYSTEM_PROMPT = (
-    "Ты — SavolBot, дружелюбный консультант. Отвечай кратко и ясно (до 6–8 предложений). "
-    "Соблюдай законы Узбекистана. Не давай инструкции по незаконным действиям, подделкам, взломам, обходу систем. "
-    "По медицине — только общая справка и совет обратиться к врачу. Язык ответа = язык вопроса (RU/UZ). "
-    "Никогда не вставляй ссылки и URL в ответ. "
-    "Не упоминай дату отсечки знаний модели. Если нужна актуальность — отвечай по фактам из поиска. "
-    "Если в контексте переписки нет предыдущих сообщений — не говори, что «не сохраняешь историю». "
-    "Вежливо попроси собеседника коротко напомнить важные детали и продолжай."
-)
-
-async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
-    if not OPENAI_API_KEY:
-        return f"Вы спросили: {user_text}"
-    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.6,
-        "messages": build_messages(user_id, system, user_text),
-    }
-    async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
-        r = await client.post("/chat/completions", headers=headers, json=payload)
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"].strip()
-        return strip_links(raw)
-
-# ============== LIVE SEARCH ХЕЛПЕРЫ ==============
-TIME_SENSITIVE_PATTERNS = [
-    r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
-    r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
-    r"\b(bugun|hozir|narx|kurs|yangilik)\b",
-    r"\b(кто|как зовут|председател|директор|ceo|руководител)\b",
-]
-def is_time_sensitive(q: str) -> bool:
-    return any(re.search(rx, q.lower()) for rx in TIME_SENSITIVE_PATTERNS)
-
-CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
-CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
-LIVE_CACHE: dict[str, dict] = {}
-
-def _norm_query(q: str) -> str: return re.sub(r"\s+", " ", q.strip().lower())
-def cache_get(q: str):
-    k = _norm_query(q); it = LIVE_CACHE.get(k)
-    if not it: return None
-    if time.time() - it["ts"] > CACHE_TTL_SECONDS:
-        LIVE_CACHE.pop(k, None); return None
-    return it["answer"]
-def cache_set(q: str, a: str):
-    if len(LIVE_CACHE) >= CACHE_MAX_ENTRIES:
-        oldest = min(LIVE_CACHE, key=lambda x: LIVE_CACHE[x]["ts"])
-        LIVE_CACHE.pop(oldest, None)
-    LIVE_CACHE[_norm_query(q)] = {"ts": time.time(), "answer": a}
-
-async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
-    if not TAVILY_API_KEY:
-        return None
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": "advanced",
-        "max_results": max_results,
-        "include_answer": True,
-        "include_domains": [],
-    }
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        r = await client.post("https://api.tavily.com/search", json=payload)
-        r.raise_for_status()
-        return r.json()
-
-async def answer_with_live_search(user_text: str, topic_hint: str | None, user_id: int) -> str:
-    c = cache_get(user_text)
-    if c:
-        return c + "\n\n(из кэша за последние 24 часа)"
-
-    data = await web_search_tavily(user_text)
-    if not data:
-        return await ask_gpt(user_text, topic_hint, user_id)
-
-    snippets = []
-    for it in (data.get("results") or [])[:5]:
-        title = (it.get("title") or "")[:120]
-        content = (it.get("content") or "")[:500]
-        snippets.append(f"- {title}\n{content}")
-
-    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
-    if topic_hint:
-        system += f" Учитывай контекст темы: {topic_hint}"
-    user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.4,
-        "messages": build_messages(user_id, system, user_aug),
-    }
-    async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
-        r = await client.post("/chat/completions", headers=headers, json=payload)
-        r.raise_for_status()
-        answer = r.json()["choices"][0]["message"]["content"].strip()
-
-    final = strip_links(answer)
-    cache_set(user_text, final)
-    return final
-
-# ============== АНАЛИТИКА: FILE + SHEETS ==============
+# ---------- Google Sheets: History worksheet helper ----------
 _sheets_client: gspread.Client | None = None
 _sheets_ws: gspread.Worksheet | None = None
 LAST_SHEETS_ERROR: str | None = None
 
+
+def _history_ws():
+    if not _sheets_client:
+        return None
+    try:
+        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        try:
+            return sh.worksheet("History")
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="History", rows=50000, cols=4)
+            ws.append_row(["ts", "user_id", "role", "content"], value_input_option="RAW")
+            return ws
+    except Exception:
+        logging.exception("_history_ws failed")
+        return None
+
+# ---------- Google Sheets init & async append ----------
+
 def _ts() -> str:
     return datetime.utcnow().isoformat()
+
 
 def _init_sheets():
     """
     Жёсткая инициализация Google Sheets:
     - поддержка raw JSON и base64
     - добавлен Drive-scope
-    - логируем список листов
     - создаём лист и заголовок при отсутствии
     """
     global _sheets_client, _sheets_ws, LAST_SHEETS_ERROR
@@ -460,8 +337,6 @@ def _init_sheets():
             creds_text = raw
 
         creds_info = json.loads(creds_text)
-        svc_email = creds_info.get("client_email", "<unknown>")
-
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
@@ -470,13 +345,6 @@ def _init_sheets():
         _sheets_client = gspread.authorize(creds)
 
         sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
-
-        try:
-            ws_titles = [ws.title for ws in sh.worksheets()]
-            logging.info("Sheets svc=%s worksheets=%s", svc_email, ws_titles)
-        except Exception:
-            logging.exception("Failed to list worksheets")
-
         try:
             _sheets_ws = sh.worksheet(SHEETS_WORKSHEET)
         except gspread.WorksheetNotFound:
@@ -494,57 +362,77 @@ def _init_sheets():
         LAST_SHEETS_ERROR = f"{type(e).__name__}: {e}"
         logging.exception("Sheets init failed")
         _sheets_client = _sheets_ws = None
-        
-def _history_ws():
-    if not _sheets_client:
-        return None
-    try:
-        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
-        try:
-            return sh.worksheet("History")
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title="History", rows=50000, cols=4)
-            ws.append_row(["ts", "user_id", "role", "content"], value_input_option="RAW")
-            return ws
-    except Exception:
-        logging.exception("_history_ws failed")
-        return None
 
-def _sheets_append(row: dict):
+
+async def _sheets_append_async(row: dict):
+    """Неблокирующая запись строки аналитики в основной лист."""
     if not _sheets_ws:
         return
     try:
-        _sheets_ws.append_row(
-            [
-                row.get("ts", ""),
-                str(row.get("user_id", "")),
-                row.get("event", ""),
-                str(row.get("topic", "")),
-                "1" if row.get("live") else "0",
-                "1" if row.get("time_sensitive") else "0",
-                row.get("mode", ""),
-                json.dumps(
-                    {k: v for k, v in row.items()
-                     if k not in {"ts", "user_id", "event", "topic", "live", "time_sensitive", "mode"}},
-                    ensure_ascii=False,
-                ),
-            ],
-            value_input_option="RAW",
-        )
+        def _do():
+            _sheets_ws.append_row(
+                [
+                    row.get("ts", ""),
+                    str(row.get("user_id", "")),
+                    row.get("event", ""),
+                    str(row.get("topic", "")),
+                    "1" if row.get("live") else "0",
+                    "1" if row.get("time_sensitive") else "0",
+                    row.get("mode", ""),
+                    json.dumps(
+                        {k: v for k, v in row.items()
+                         if k not in {"ts", "user_id", "event", "topic", "live", "time_sensitive", "mode"}},
+                        ensure_ascii=False,
+                    ),
+                ],
+                value_input_option="RAW",
+            )
+        await asyncio.to_thread(_do)
     except Exception as e:
         logging.warning("Sheets append failed: %s", e)
 
-def log_event(user_id: int, name: str, **payload):
-    row = {"ts": _ts(), "user_id": user_id, "event": name, **payload}
-    # файл JSONL
+
+async def _sheets_append_history_async(user_id: int, role: str, content: str):
+    """Неблокирующая запись сообщения в лист History."""
+    if not _sheets_client:
+        return
+    try:
+        def _do():
+            ws = _history_ws()
+            if not ws:
+                return
+            ws.append_row([
+                datetime.utcnow().isoformat(),
+                str(user_id),
+                role,
+                content,
+            ], value_input_option="RAW")
+        await asyncio.to_thread(_do)
+    except Exception:
+        logging.exception("append_history: sheets write failed")
+
+
+# ============== АНАЛИТИКА: FILE + SHEETS ==============
+
+def _log_to_file(row: dict):
     try:
         p = Path(ANALYTICS_DB_PATH); p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception as e:
         logging.warning("log_event file failed: %s", e)
-    # Google Sheets
-    _sheets_append(row)
+
+
+def log_event(user_id: int, name: str, **payload):
+    row = {"ts": _ts(), "user_id": user_id, "event": name, **payload}
+    _log_to_file(row)
+    # Google Sheets — в фоне, не блокируем обработчик
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_append_async(row))
+    except RuntimeError:
+        pass
+
 
 def format_stats(days: int | None = 7):
     p = Path(ANALYTICS_DB_PATH)
@@ -581,6 +469,161 @@ def format_stats(days: int | None = 7):
         f"• Активных подписок сейчас: {active_now}",
     ]
     return "\n".join(lines)
+
+# ============== ИСТОРИЯ API ==============
+
+def append_history(user_id: int, role: str, content: str):
+    lst = HISTORY.setdefault(user_id, [])
+    lst.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
+    if len(lst) > 20:          # окно (~10 последних обменов)
+        del lst[: len(lst) - 20]
+    save_history()
+    # Запись в Google Sheets — неблокирующая
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_append_history_async(user_id, role, content))
+    except RuntimeError:
+        pass
+
+
+def get_recent_history(user_id: int, max_chars: int = 6000) -> list[dict]:
+    if not HISTORY.get(user_id):  # локально пусто → пробуем загрузить из Sheets (последние 20)
+        try:
+            def _load():
+                ws = _history_ws()
+                if not ws:
+                    return []
+                rows = ws.get_all_values()  # [["ts","uid","role","content"], ...]
+                return [r for r in rows[1:] if r[1] == str(user_id)][-20:]
+            rows = asyncio.run(asyncio.to_thread(_load)) if asyncio.get_event_loop().is_closed() else []
+        except Exception:
+            rows = []
+        if rows:
+            HISTORY[user_id] = [{"role": r[2], "content": r[3], "ts": r[0]} for r in rows]
+    total = 0; picked = []
+    for item in reversed(HISTORY.get(user_id, [])):
+        c = item.get("content") or ""
+        total += len(c)
+        if total > max_chars: break
+        picked.append({"role": item["role"], "content": c})
+    return list(reversed(picked))
+
+
+def build_messages(user_id: int, system: str, user_text: str) -> list[dict]:
+    msgs = [{"role": "system", "content": system}]
+    msgs.extend(get_recent_history(user_id))
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+# ============== ИИ ==============
+BASE_SYSTEM_PROMPT = (
+    "Ты — SavolBot, дружелюбный консультант. Отвечай кратко и ясно (до 6–8 предложений). "
+    "Соблюдай законы Узбекистана. Не давай инструкции по незаконным действиям, подделкам, взломам, обходу систем. "
+    "По медицине — только общая справка и совет обратиться к врачу. Язык ответа = язык вопроса (RU/UZ). "
+    "Никогда не вставляй ссылки и URL в ответ. "
+    "Не упоминай дату отсечки знаний модели. Если нужна актуальность — отвечай по фактам из поиска. "
+    "Если в контексте переписки нет предыдущих сообщений — не говори, что «не сохраняешь историю». "
+    "Вежливо попроси собеседника коротко напомнить важные детали и продолжай."
+)
+
+async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
+    if not OPENAI_API_KEY:
+        return f"Вы спросили: {user_text}"
+    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.6,
+        "messages": build_messages(user_id, system, user_text),
+    }
+    r = await client_openai.post("/chat/completions", headers=headers, json=payload)
+    r.raise_for_status()
+    raw = r.json()["choices"][0]["message"]["content"].strip()
+    return strip_links(raw)
+
+# ============== LIVE SEARCH ХЕЛПЕРЫ ==============
+TIME_SENSITIVE_PATTERNS = [
+    r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
+    r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
+    r"\b(bugun|hozir|narx|kurs|yangilik)\b",
+    r"\b(кто|как зовут|председател|директор|ceo|руководител)\b",
+]
+
+def is_time_sensitive(q: str) -> bool:
+    return any(re.search(rx, q.lower()) for rx in TIME_SENSITIVE_PATTERNS)
+
+CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
+CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
+LIVE_CACHE: dict[str, dict] = {}
+
+
+def _norm_query(q: str) -> str:
+    return re.sub(r"\s+", " ", q.strip().lower())
+
+def cache_get(q: str):
+    k = _norm_query(q); it = LIVE_CACHE.get(k)
+    if not it: return None
+    if time.time() - it["ts"] > CACHE_TTL_SECONDS:
+        LIVE_CACHE.pop(k, None); return None
+    return it["answer"]
+
+def cache_set(q: str, a: str):
+    if len(LIVE_CACHE) >= CACHE_MAX_ENTRIES:
+        oldest = min(LIVE_CACHE, key=lambda x: LIVE_CACHE[x]["ts"])
+        LIVE_CACHE.pop(oldest, None)
+    LIVE_CACHE[_norm_query(q)] = {"ts": time.time(), "answer": a}
+
+
+async def web_search_tavily(query: str, max_results: int = 3) -> dict | None:
+    if not TAVILY_API_KEY:
+        return None
+    depth = "advanced" if is_time_sensitive(query) else "basic"
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": depth,
+        "max_results": max_results,
+        "include_answer": True,
+        "include_domains": [],
+    }
+    r = await client_http.post("https://api.tavily.com/search", json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+async def answer_with_live_search(user_text: str, topic_hint: str | None, user_id: int) -> str:
+    c = cache_get(user_text)
+    if c:
+        return c + "\n\n(из кэша за последние 24 часа)"
+
+    data = await web_search_tavily(user_text)
+    if not data:
+        return await ask_gpt(user_text, topic_hint, user_id)
+
+    snippets = []
+    for it in (data.get("results") or [])[:3]:
+        title = (it.get("title") or "")[:80]
+        content = (it.get("content") or "")[:350]
+        snippets.append(f"- {title}\n{content}")
+
+    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
+    if topic_hint:
+        system += f" Учитывай контекст темы: {topic_hint}"
+    user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.3,
+        "messages": build_messages(user_id, system, user_aug),
+    }
+    r = await client_openai.post("/chat/completions", headers=headers, json=payload)
+    r.raise_for_status()
+    answer = r.json()["choices"][0]["message"]["content"].strip()
+
+    final = strip_links(answer)
+    cache_set(user_text, final)
+    return final
 
 # ============== КОМАНДЫ ==============
 @dp.message(Command("start"))
@@ -677,10 +720,16 @@ async def cmd_gs_test(message: Message):
     if not _sheets_ws:
         return await message.answer("❌ Sheets не инициализирован. Сначала /gs_debug и поправь ENV.")
     try:
-        _sheets_ws.append_row(
-            [datetime.utcnow().isoformat(), str(message.from_user.id), "gs_test", "", "0", "0", "manual", "{}"],
-            value_input_option="RAW"
-        )
+        # Быстрая запись тестовой строки (в фоне)
+        await _sheets_append_async({
+            "ts": datetime.utcnow().isoformat(),
+            "user_id": message.from_user.id,
+            "event": "gs_test",
+            "topic": "",
+            "live": False,
+            "time_sensitive": False,
+            "mode": "manual",
+        })
         await message.answer("✅ Записал тестовую строку в Google Sheets.")
     except Exception:
         logging.exception("gs_test append failed")
@@ -703,16 +752,17 @@ async def cmd_gs_try(message: Message):
     try:
         if not _sheets_client:
             return await message.answer("❌ Sheets client не инициализирован. /gs_reinit")
-        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
-        try:
-            ws = sh.worksheet(SHEETS_WORKSHEET)
-        except gspread.WorksheetNotFound:
-            ws = sh.sheet1  # fallback — первый лист
-        ws.append_row(
-            [datetime.utcnow().isoformat(), str(message.from_user.id), "gs_try", "", "0", "0", "manual", "{}"],
-            value_input_option="RAW"
-        )
-        await message.answer(f"✅ Записал строку в лист '{ws.title}'.")
+        # Неблокирующая запись
+        await _sheets_append_async({
+            "ts": datetime.utcnow().isoformat(),
+            "user_id": message.from_user.id,
+            "event": "gs_try",
+            "topic": "",
+            "live": False,
+            "time_sensitive": False,
+            "mode": "manual",
+        })
+        await message.answer("✅ Записал строку в активный лист.")
     except Exception as e:
         logging.exception("gs_try failed")
         await message.answer(f"❌ gs_try ошибка: {e}")
@@ -792,7 +842,7 @@ async def cmd_grant_start(message: Message):
 @dp.message(F.text)
 async def handle_text(message: Message):
     text = message.text.strip()
-    uid = message.from_user.id  # <-- нужен для истории
+    uid = message.from_user.id  # нужен для истории
     u = get_user(uid)
     if is_uzbek(text):
         u["lang"] = "uz"; save_users()
@@ -804,22 +854,19 @@ async def handle_text(message: Message):
         return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
 
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    use_live = True  # всегда через Live Search
+    use_live = True  # всегда через Live Search (можно заменить на is_time_sensitive(text) для скорости)
 
     try:
         reply = await (answer_with_live_search(text, topic_hint, uid)
                        if use_live else ask_gpt(text, topic_hint, uid))
         await message.answer(reply)
 
-        # Если у тебя есть блок истории — сохраняем:
-        try:
-            append_history(uid, "user", text)
-            append_history(uid, "assistant", reply)
-        except NameError:
-            pass  # истории нет — ок
+        # История
+        append_history(uid, "user", text)
+        append_history(uid, "assistant", reply)
 
         log_event(uid, "question",
-                  topic=u.get("topic"), live=use_live, time_sensitive=False,
+                  topic=u.get("topic"), live=use_live, time_sensitive=is_time_sensitive(text),
                   whitelisted=is_whitelisted(uid))
     except Exception:
         logging.exception("OpenAI error")
@@ -841,5 +888,3 @@ async def telegram_webhook(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-
