@@ -298,13 +298,56 @@ async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.6,
-        "messages": build_messages(user_id, system, user_text)  # <—
+        "messages": build_messages(user_id, system, user_text),
     }
     async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
         r = await client.post("/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
         return strip_links(raw)
+
+# ============== LIVE SEARCH ХЕЛПЕРЫ ==============
+TIME_SENSITIVE_PATTERNS = [
+    r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
+    r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
+    r"\b(bugun|hozir|narx|kurs|yangilik)\b",
+    r"\b(кто|как зовут|председател|директор|ceo|руководител)\b",
+]
+def is_time_sensitive(q: str) -> bool:
+    return any(re.search(rx, q.lower()) for rx in TIME_SENSITIVE_PATTERNS)
+
+CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
+CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
+LIVE_CACHE: dict[str, dict] = {}
+
+def _norm_query(q: str) -> str: return re.sub(r"\s+", " ", q.strip().lower())
+def cache_get(q: str):
+    k = _norm_query(q); it = LIVE_CACHE.get(k)
+    if not it: return None
+    if time.time() - it["ts"] > CACHE_TTL_SECONDS:
+        LIVE_CACHE.pop(k, None); return None
+    return it["answer"]
+def cache_set(q: str, a: str):
+    if len(LIVE_CACHE) >= CACHE_MAX_ENTRIES:
+        oldest = min(LIVE_CACHE, key=lambda x: LIVE_CACHE[x]["ts"])
+        LIVE_CACHE.pop(oldest, None)
+    LIVE_CACHE[_norm_query(q)] = {"ts": time.time(), "answer": a}
+
+async def web_search_tavily(query: str, max_results: int = 5) -> dict | None:
+    if not TAVILY_API_KEY:
+        return None
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "advanced",
+        "max_results": max_results,
+        "include_answer": True,
+        "include_domains": [],
+    }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        r = await client.post("https://api.tavily.com/search", json=payload)
+        r.raise_for_status()
+        return r.json()
 
 async def answer_with_live_search(user_text: str, topic_hint: str | None, user_id: int) -> str:
     c = cache_get(user_text)
@@ -315,6 +358,7 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None, user_i
     if not data:
         return await ask_gpt(user_text, topic_hint, user_id)
 
+    # Сниппеты только текстовые — без URL
     snippets = []
     for it in (data.get("results") or [])[:5]:
         title = (it.get("title") or "")[:120]
@@ -330,7 +374,7 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None, user_i
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.4,
-        "messages": build_messages(user_id, system, user_aug)  # <—
+        "messages": build_messages(user_id, system, user_aug),
     }
     async with httpx.AsyncClient(timeout=30.0, base_url=OPENAI_API_BASE) as client:
         r = await client.post("/chat/completions", headers=headers, json=payload)
@@ -340,7 +384,7 @@ async def answer_with_live_search(user_text: str, topic_hint: str | None, user_i
     final = strip_links(answer)
     cache_set(user_text, final)
     return final
-
+    
 # ============== LIVE SEARCH ==============
 TIME_SENSITIVE_PATTERNS = [
     r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
@@ -768,33 +812,40 @@ async def cmd_grant_start(message: Message):
 @dp.message(F.text)
 async def handle_text(message: Message):
     text = message.text.strip()
-    u = get_user(message.from_user.id)
+    uid = message.from_user.id  # <-- нужен для истории
+    u = get_user(uid)
     if is_uzbek(text):
         u["lang"] = "uz"; save_users()
     if violates_policy(text):
-        log_event(message.from_user.id, "question_blocked", reason="policy")
+        log_event(uid, "question_blocked", reason="policy")
         return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
-    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)) and u["free_used"] >= FREE_LIMIT:
-        log_event(message.from_user.id, "paywall_shown")
+    if (not is_whitelisted(uid)) and (not has_active_sub(u)) and u["free_used"] >= FREE_LIMIT:
+        log_event(uid, "paywall_shown")
         return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
 
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    # хочешь — всегда гоним через live-поиск:
-    use_live = True
+    use_live = True  # всегда через Live Search
 
     try:
-        reply = await (answer_with_live_search(text, topic_hint) if use_live else ask_gpt(text, topic_hint))
+        reply = await (answer_with_live_search(text, topic_hint, uid)
+                       if use_live else ask_gpt(text, topic_hint, uid))
         await message.answer(reply)
-        log_event(
-            message.from_user.id, "question",
-            topic=u.get("topic"), live=use_live, time_sensitive=False,
-            whitelisted=is_whitelisted(message.from_user.id)
-        )
+
+        # Если у тебя есть блок истории — сохраняем:
+        try:
+            append_history(uid, "user", text)
+            append_history(uid, "assistant", reply)
+        except NameError:
+            pass  # истории нет — ок
+
+        log_event(uid, "question",
+                  topic=u.get("topic"), live=use_live, time_sensitive=False,
+                  whitelisted=is_whitelisted(uid))
     except Exception:
         logging.exception("OpenAI error")
         return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
 
-    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)):
+    if (not is_whitelisted(uid)) and (not has_active_sub(u)):
         u["free_used"] += 1; save_users()
 
 # ============== WEBHOOK ==============
