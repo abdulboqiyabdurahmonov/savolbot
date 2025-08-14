@@ -765,29 +765,34 @@ async def cmd_grant_start(message: Message):
 @dp.message(F.text)
 async def handle_text(message: Message):
     text = message.text.strip()
-    uid = message.from_user.id  # <-- добавили
-    u = get_user(uid)
-    ...
-    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
+    u = get_user(message.from_user.id)
+    if is_uzbek(text):
+        u["lang"] = "uz"; save_users()
+    if violates_policy(text):
+        log_event(message.from_user.id, "question_blocked", reason="policy")
+        return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
+    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)) and u["free_used"] >= FREE_LIMIT:
+        log_event(message.from_user.id, "paywall_shown")
+        return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
 
-    #  Вариант 1: всегда Live-поиск
+    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
+    # хочешь — всегда гоним через live-поиск:
     use_live = True
 
-    #  Вариант 2: авто по актуальности (если хочешь оставить)
-    # time_sens = is_time_sensitive(text)
-    # use_live = time_sens
-
     try:
-        reply = await (answer_with_live_search(text, topic_hint, uid) if use_live
-                       else ask_gpt(text, topic_hint, uid))
+        reply = await (answer_with_live_search(text, topic_hint) if use_live else ask_gpt(text, topic_hint))
         await message.answer(reply)
+        log_event(
+            message.from_user.id, "question",
+            topic=u.get("topic"), live=use_live, time_sensitive=False,
+            whitelisted=is_whitelisted(message.from_user.id)
+        )
+    except Exception:
+        logging.exception("OpenAI error")
+        return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
 
-        # <<< сохраняем историю >>>
-        append_history(uid, "user", text)
-        append_history(uid, "assistant", reply)
-        # <<< логирование как и раньше >>>
-        log_event(uid, "question", topic=u.get("topic"), live=use_live,
-                  time_sensitive=False, whitelisted=is_whitelisted(uid))
+    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)):
+        u["free_used"] += 1; save_users()
 
 # ============== WEBHOOK ==============
 @app.post("/webhook")
@@ -802,3 +807,5 @@ async def telegram_webhook(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
