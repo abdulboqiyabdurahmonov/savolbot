@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter
@@ -65,18 +66,40 @@ async def lifespan(app: FastAPI):
     load_users()
     load_history()
     _init_sheets()
+
+    # Глобальные клиенты
+    global client_openai, client_http
+    client_openai = httpx.AsyncClient(base_url=OPENAI_API_BASE, timeout=HTTPX_TIMEOUT, http2=True)
+    client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=True)
+
     # webhook проставим на старте
     if TELEGRAM_TOKEN and WEBHOOK_URL:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-                    json={"url": WEBHOOK_URL, "secret_token": WEBHOOK_SECRET},
-                )
-                logging.info("setWebhook: %s %s", resp.status_code, resp.text)
+            resp = await client_http.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+                json={
+                    "url": WEBHOOK_URL,
+                    "secret_token": WEBHOOK_SECRET,
+                    "drop_pending_updates": True,
+                    "max_connections": 80,
+                    "allowed_updates": ["message", "callback_query"],
+                },
+            )
+            logging.info("setWebhook: %s %s", resp.status_code, resp.text)
         except Exception:
             logging.exception("Failed to set webhook")
-    yield
+
+    try:
+        yield
+    finally:
+        try:
+            await client_openai.aclose()
+        except Exception:
+            pass
+        try:
+            await client_http.aclose()
+        except Exception:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
