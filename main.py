@@ -620,6 +620,11 @@ async def cmd_stats(message: Message):
     days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
     await message.answer(format_stats(days))
 
+@dp.message(Command("new"))
+async def cmd_new(message: Message):
+    reset_history(message.from_user.id)
+    await message.answer("🧹 Контекст очищен. Начинаем новую тему.")
+
 # -------- Sheets диагностика/починка ----------
 @dp.message(Command("gs_debug"))
 async def cmd_gs_debug(message: Message):
