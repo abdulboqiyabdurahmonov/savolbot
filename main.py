@@ -112,13 +112,9 @@ SOURCES_BLOCK_PAT = re.compile(r'(?is)\n+источники:\s*.*$')
 def strip_links(text: str) -> str:
     if not text:
         return text
-    # 1) [текст](url) -> "текст"
-    text = MD_LINK_PAT.sub(r'\1', text)
-    # 2) голые url -> удаляем
-    text = LINK_PAT.sub('', text)
-    # 3) блок "Источники: ..." до конца -> удалить
-    text = SOURCES_BLOCK_PAT.sub('', text)
-    # 4) подчистить лишние пробелы/пустые строки
+    text = MD_LINK_PAT.sub(r'\1', text)      # markdown-ссылки -> текст
+    text = LINK_PAT.sub('', text)            # голые URL -> удалить
+    text = SOURCES_BLOCK_PAT.sub('', text)   # убрать хвост "Источники: ..."
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
     return text
@@ -167,6 +163,7 @@ def _serialize_user(u: dict) -> dict:
         "paid_until": u["paid_until"].isoformat() if u.get("paid_until") else None,
         "lang": u.get("lang", "ru"),
         "topic": u.get("topic"),
+        # поле 'live' оставлено для совместимости, но больше не используется
         "live": bool(u.get("live", False)),
     }
 
@@ -198,7 +195,7 @@ def load_users():
                 "paid_until": paid_until,
                 "lang": v.get("lang", "ru"),
                 "topic": v.get("topic"),
-                "live": bool(v.get("live", False)),
+                "live": bool(v.get("live", False)),  # не используется
             }
     except Exception:
         logging.exception("load_users failed")
@@ -483,14 +480,15 @@ async def cmd_start(message: Message):
         "👋 Привет! / Assalomu alaykum!\n"
         "Первые 2 ответа — бесплатно, дальше подписка «Старт».\n"
         "Выберите тему: /topics\n"
-        "Для свежих данных включите live-поиск: /live_on"
+        "Актуальные данные (курс, новости, цены и т.п.) подхватываю автоматически."
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     log_event(message.from_user.id, "help")
     await message.answer(
-        "ℹ️ Пишите вопрос (RU/UZ). /topics — выбор темы. /live_on — включить интернет-поиск.\n"
+        "ℹ️ Пишите вопрос (RU/UZ). /topics — выбор темы.\n"
+        "Если вопрос про актуальные вещи (цены, курс, новости и т.п.) — я сам использую интернет-поиск.\n"
         "Первые 2 ответа — бесплатно; дальше /tariffs."
     )
 
@@ -511,13 +509,12 @@ async def cmd_myplan(message: Message):
     status = "активна" if has_active_sub(u) else "нет"
     until = u["paid_until"].isoformat() if u["paid_until"] else "—"
     topic = u.get("topic") or "—"
-    live = "вкл" if u.get("live") else "выкл"
     is_wl = is_whitelisted(message.from_user.id)
     plan_label = "whitelist (безлимит)" if is_wl else u["plan"]
     free_info = "безлимит" if is_wl else f"{u['free_used']}/{FREE_LIMIT}"
     log_event(message.from_user.id, "myplan_open", whitelisted=is_wl)
     await message.answer(
-        f"Ваш план: {plan_label} | Live: {live}\n"
+        f"Ваш план: {plan_label}\n"
         f"Подписка: {status} (до {until})\n"
         f"Тема: {topic}\n"
         f"Бесплатно: {free_info}"
@@ -529,42 +526,6 @@ async def cmd_topics(message: Message):
     log_event(message.from_user.id, "topics_open")
     head = "🗂 Выберите тему:" if lang == "ru" else "🗂 Mavzuni tanlang:"
     await message.answer(head, reply_markup=topic_kb(lang, current=u.get("topic")))
-
-@dp.message(Command("asklive"))
-async def cmd_asklive(message: Message):
-    u = get_user(message.from_user.id)
-    q = message.text.replace("/asklive", "", 1).strip()
-    if not q:
-        return await message.answer("Напишите так: /asklive ваш вопрос")
-    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)) and u["free_used"] >= FREE_LIMIT:
-        log_event(message.from_user.id, "paywall_shown")
-        return await message.answer("💳 Доступ ограничен. Оформите подписку:", reply_markup=pay_kb())
-    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    try:
-        reply = await answer_with_live_search(q, topic_hint)
-        await message.answer(reply)
-        log_event(
-            message.from_user.id, "question",
-            mode="asklive", topic=u.get("topic"), live=True, time_sensitive=True,
-            whitelisted=is_whitelisted(message.from_user.id)
-        )
-    except Exception:
-        logging.exception("Live error")
-        return await message.answer("Не получилось получить актуальные данные. Попробуйте позже.")
-    if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)):
-        u["free_used"] += 1; save_users()
-
-@dp.message(Command("live_on"))
-async def cmd_live_on(message: Message):
-    u = get_user(message.from_user.id); u["live"] = True; save_users()
-    log_event(message.from_user.id, "live_on")
-    await message.answer("✅ Live-поиск включён.")
-
-@dp.message(Command("live_off"))
-async def cmd_live_off(message: Message):
-    u = get_user(message.from_user.id); u["live"] = False; save_users()
-    log_event(message.from_user.id, "live_off")
-    await message.answer("⏹ Live-поиск выключён.")
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
@@ -723,8 +684,11 @@ async def handle_text(message: Message):
     if (not is_whitelisted(message.from_user.id)) and (not has_active_sub(u)) and u["free_used"] >= FREE_LIMIT:
         log_event(message.from_user.id, "paywall_shown")
         return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
+
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    time_sens = is_time_sensitive(text); use_live = u.get("live") or time_sens
+    time_sens = is_time_sensitive(text)
+    use_live = time_sens  # <— автоматический live только для актуальных вопросов
+
     try:
         reply = await (answer_with_live_search(text, topic_hint) if use_live else ask_gpt(text, topic_hint))
         await message.answer(reply)
