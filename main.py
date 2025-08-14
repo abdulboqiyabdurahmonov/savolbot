@@ -262,11 +262,30 @@ def reset_history(user_id: int):
 def append_history(user_id: int, role: str, content: str):
     lst = HISTORY.setdefault(user_id, [])
     lst.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
-    if len(lst) > 20:          # окно (~10 последних обменов)
+    if len(lst) > 20:
         del lst[: len(lst) - 20]
     save_history()
+    # === пишем строку в Google Sheets ===
+    try:
+        ws = _history_ws()
+        if ws:
+            ws.append_row(
+                [datetime.utcnow().isoformat(), str(user_id), role, content],
+                value_input_option="RAW"
+            )
+    except Exception:
+        logging.exception("append_history: sheets write failed")
 
 def get_recent_history(user_id: int, max_chars: int = 6000) -> list[dict]:
+    if not HISTORY.get(user_id):  # локально пусто → пробуем загрузить из Sheets (последние 20)
+        try:
+            ws = _history_ws()
+            if ws:
+                rows = ws.get_all_values()  # [["ts","uid","role","content"], ...]
+                last = [r for r in rows[1:] if r[1] == str(user_id)][-20:]
+                HISTORY[user_id] = [{"role": r[2], "content": r[3], "ts": r[0]} for r in last]
+        except Exception:
+            logging.exception("get_recent_history: sheets read failed")
     total = 0; picked = []
     for item in reversed(HISTORY.get(user_id, [])):
         c = item.get("content") or ""
@@ -287,7 +306,9 @@ BASE_SYSTEM_PROMPT = (
     "Соблюдай законы Узбекистана. Не давай инструкции по незаконным действиям, подделкам, взломам, обходу систем. "
     "По медицине — только общая справка и совет обратиться к врачу. Язык ответа = язык вопроса (RU/UZ). "
     "Никогда не вставляй ссылки и URL в ответ. "
-    "Не упоминай дату отсечки знаний модели. Если нужна актуальность — отвечай по фактам из поиска."
+    "Не упоминай дату отсечки знаний модели. Если нужна актуальность — отвечай по фактам из поиска. "
+    "Если в контексте переписки нет предыдущих сообщений — не говори, что «не сохраняешь историю». "
+    "Вежливо попроси собеседника коротко напомнить важные детали и продолжай."
 )
 
 async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
@@ -450,6 +471,21 @@ def _init_sheets():
         LAST_SHEETS_ERROR = f"{type(e).__name__}: {e}"
         logging.exception("Sheets init failed")
         _sheets_client = _sheets_ws = None
+        
+def _history_ws():
+    if not _sheets_client:
+        return None
+    try:
+        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        try:
+            return sh.worksheet("History")
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="History", rows=50000, cols=4)
+            ws.append_row(["ts", "user_id", "role", "content"], value_input_option="RAW")
+            return ws
+    except Exception:
+        logging.exception("_history_ws failed")
+        return None
 
 def _sheets_append(row: dict):
     if not _sheets_ws:
