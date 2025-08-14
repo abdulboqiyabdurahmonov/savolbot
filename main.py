@@ -66,26 +66,34 @@ bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 dp = Dispatcher()
 
 # Lifespan — корректный старт для FastAPI (вместо on_event)
+from contextlib import asynccontextmanager
+
+# Глобальные клиенты (инициализируем в lifespan)
+client_openai = None
+client_http = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Загружаем локальные БД/историю/Sheets
     load_users()
     load_history()
     _init_sheets()
 
-    # Глобальные клиенты
-    global client_openai, client_http
-    # Опциональный HTTP/2: включается только если есть пакет h2 и переменная окружения HTTP2_ENABLED=1
-HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "0") == "1"
-try:
-    import h2  # type: ignore
-    _h2_ok = True
-except Exception:
-    _h2_ok = False
-use_http2 = HTTP2_ENABLED and _h2_ok
-client_openai = httpx.AsyncClient(base_url=OPENAI_API_BASE, timeout=HTTPX_TIMEOUT, http2=use_http2)
-client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=use_http2)
+    # ——— HTTP/2 только если реально доступен и явно включён флагом
+    HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "0") == "1"
+    try:
+        import h2  # noqa: F401
+        _h2_ok = True
+    except Exception:
+        _h2_ok = False
+    use_http2 = HTTP2_ENABLED and _h2_ok
 
-    # webhook проставим на старте
+    # ——— создаём общие httpx-клиенты
+    global client_openai, client_http
+    client_openai = httpx.AsyncClient(base_url=OPENAI_API_BASE, timeout=HTTPX_TIMEOUT, http2=use_http2)
+    client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=use_http2)
+
+    # ——— на старте ставим вебхук
     if TELEGRAM_TOKEN and WEBHOOK_URL:
         try:
             resp = await client_http.post(
@@ -103,8 +111,10 @@ client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=use_http2)
             logging.exception("Failed to set webhook")
 
     try:
+        # даём приложению стартануть
         yield
     finally:
+        # корректно закрываем клиенты
         try:
             await client_openai.aclose()
         except Exception:
