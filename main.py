@@ -361,6 +361,7 @@ if isinstance(creds_info, dict) and "private_key" in creds_info and creds_info.g
     if "BEGIN PRIVATE KEY" not in pk:
         creds_info["private_key"] = pk.replace("\n", "
 ")
+                                               
 # Базовая валидация, чтобы ловить ошибки конфигурации раньше
 for field in ("client_email", "private_key"):
     if not creds_info.get(field):
