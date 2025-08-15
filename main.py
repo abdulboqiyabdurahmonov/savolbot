@@ -471,16 +471,27 @@ BASE_SYSTEM_PROMPT = (
     "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами."
 )
 
-async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
-    if not OPENAI_API_KEY:
-        return f"Вы спросили: {user_text}"
-    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.6,
-        "messages": build_messages(user_id, system, user_text),
-    }
+def ask_gpt(prompt):
+    retries = 3
+    for attempt in range(retries):
+        try:
+            r = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": prompt}]
+                },
+                timeout=30
+            )
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and attempt < retries - 1:
+                time.sleep(2 ** attempt)  # Экспоненциальная пауза
+                continue
+            else:
+                raise
 
     async def _do():
         return await client_openai.post("/chat/completions", headers=headers, json=payload)
