@@ -58,6 +58,9 @@ client_http: Optional[httpx.AsyncClient] = None
 MODEL_CONCURRENCY = int(os.getenv("MODEL_CONCURRENCY", "4"))
 _model_sem = asyncio.Semaphore(MODEL_CONCURRENCY)
 
+# Общий таймаут на формирование ответа пользователю (секунды)
+REPLY_TIMEOUT_SEC = int(os.getenv("REPLY_TIMEOUT_SEC", "12"))
+
 # Белый список (VIP) — пользователи без ограничений
 WL_RAW = os.getenv("WHITELIST_USERS", "557891018,1942344627")
 try:
@@ -381,11 +384,8 @@ async def _sheets_register_user_async(user_id: int):
             if not ws:
                 return
             paid = u['paid_until'].isoformat() if u.get('paid_until') else ""
-            username = ""
-            first_name = ""
-            last_name = ""
             ws.append_row(
-                [datetime.utcnow().isoformat(), str(user_id), username, first_name, last_name, u.get('lang', 'ru'), u.get('plan', 'trial'), paid],
+                [datetime.utcnow().isoformat(), str(user_id), "", "", "", u.get('lang', 'ru'), u.get('plan', 'trial'), paid],
                 value_input_option="RAW"
             )
         await asyncio.to_thread(_do)
@@ -595,7 +595,7 @@ async def send_thinking_progress(message: Message) -> Message:
     """Отправляет сообщение-прогресс и возвращает его для последующего редактирования."""
     try:
         m = await message.answer("⏳ Думаю…")
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.4)
         await m.edit_text("🔎 Собираю информацию…")
         return m
     except Exception:
@@ -654,7 +654,7 @@ async def cmd_start(message: Message):
     hello = WELCOME_UZ if u["lang"] == "uz" else WELCOME_RU
     await message.answer(hello)
 
-@dp.message(Command("help"))
+@dp.message(Command("help")))
 async def cmd_help(message: Message):
     u = get_user(message.from_user.id)
     txt = "ℹ️ Напишите вопрос (RU/UZ). Я умею генерировать картинки и помогать с документами.\n/tariffs — тариф, /myplan — план, /topics — тема." \
@@ -783,8 +783,7 @@ async def cb_topic(call: CallbackQuery):
         return await call.answer("OK")
     if key in TOPICS:
         u["topic"] = key; save_users()
-        lang = u["lang"]; title = TOPICS[key]["title_уз"] if lang == "uz" else TOPICS[key]["title_ru"]  # typo guard
-        title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
+        lang = u["lang"]; title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
         await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
 
@@ -856,11 +855,14 @@ async def handle_text(message: Message):
     thinking_msg = await send_thinking_progress(message)
 
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    use_live = True  # можно сделать is_time_sensitive(text)
+    use_live = is_time_sensitive(text)  # включаем интернет-поиск только для «актуальных» вопросов
+
+    async def _get_answer():
+        return await (answer_with_live_search(text, topic_hint, uid) if use_live else ask_gpt(text, topic_hint, uid))
 
     try:
-        reply = await (answer_with_live_search(text, topic_hint, uid)
-                       if use_live else ask_gpt(text, topic_hint, uid))
+        # Общий таймаут на получение ответа, чтобы «не зависал и не думал долго»
+        reply = await asyncio.wait_for(_get_answer(), timeout=REPLY_TIMEOUT_SEC)
         reply = strip_links_and_cleanup(reply)
 
         # Редактируем плейсхолдер на итоговый ответ
@@ -872,6 +874,12 @@ async def handle_text(message: Message):
         append_history(uid, "user", text)
         append_history(uid, "assistant", reply)
 
+    except asyncio.TimeoutError:
+        err_txt = _friendly_error_text(asyncio.TimeoutError(), u.get("lang","ru"))
+        try:
+            await thinking_msg.edit_text(err_txt)
+        except Exception:
+            await message.answer(err_txt)
     except Exception as e:
         logging.exception("handle_text fatal")
         err_txt = _friendly_error_text(e, u.get("lang", "ru"))
