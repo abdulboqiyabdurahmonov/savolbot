@@ -15,70 +15,6 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, Update, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-# --- Memory guard / recall helpers ---
-RECALL_PATTERNS = [
-    r"\b(помни(шь|те)|вспомни(шь|те))\b",
-    r"\b(что|о\s*чём|о\s*чем)\b.*\b(спрашивал|говорили|обсуждали)\b",
-    r"\b(вчера|сегодня)\b.*\b(диалог|разговор|чат)\b",
-]
-
-DISALLOWED_MEM_PHRASES = [
-    r"не могу вспомнить предыдущ(ие|ие) разговор(ы|а)",
-    r"я не сохраняю историю разговоров",
-    r"не\s*сохраня(ю|ем)\s*историю",
-    r"я не помню( наш)? предыдущ(ий|ие) разговор(ы)?",
-]
-
-def sanitize_answer(a: str) -> str:
-    txt = a or ""
-    low = txt.lower()
-    if any(re.search(rx, low) for rx in DISALLOWED_MEM_PHRASES):
-        return "Пока в контексте вижу только текущие сообщения. Напомни, пожалуйста, ключевые детали — и я подхвачу."
-    return txt
-
-def quick_recap(uid: int, n: int = 6) -> str:
-    msgs = HISTORY.get(uid, [])
-    if not msgs:
-        return "Пока в этом чате вижу только текущее сообщение. Напомни коротко, о чём речь — и продолжим."
-    lines = []
-    for m in msgs[-n:]:
-        role = "Ты" if m["role"] == "user" else "Я"
-        c = (m.get("content") or "").replace("\n", " ").strip()
-        if len(c) > 200: c = c[:200] + "…"
-        lines.append(f"• {role}: {c}")
-    return "Краткое напоминание последних сообщений:\n" + "\n".join(lines)
-
-# --- Тематическое резюме истории для "помнишь?" ---
-THEME_MAP = [
-    ("Путешествия/погода", r"\b(погод|сезон|мальдив|бали|пхукет|нячан|турци|мармарис|бодрум|виз|отел)\b"),
-    ("Стихи/тексты",       r"\b(стих|поэм|смс|текст|пост|истори[йи]|картинку)\b"),
-    ("SavolBot/боты/код",  r"\b(бот|webhook|render|aiogram|код|python|ошибк|лимит|подписк|main\.py)\b"),
-    ("Бизнес/обзвоны",     r"\b(обзвон|ivr|triplea|тариф|лид|white\s*label|колл-центр|контакт-центр)\b"),
-    ("Финансы/закупки",    r"\b(договор|акти|счет|оплат|тендер|shartnoma|narx|so'?m|сум)\b"),
-    ("Здоровье",           r"\b(язв|температур|лекарств|имодиум|врач|симптом)\b"),
-    ("Авто",               r"\b(камри|авто|двигател|вибраци|расход|запас хода)\b"),
-    ("Право/штрафы",       r"\b(штраф|обжал|парковк|номера|госуслуг)\b"),
-]
-
-def summarize_themes_from_history(uid: int, lookback: int = 14) -> list[str]:
-    msgs = HISTORY.get(uid, [])
-    if not msgs:
-        return []
-    corpus = " ".join((m.get("content") or "") for m in msgs[-lookback:])
-    found = []
-    for label, rx in THEME_MAP:
-        if re.search(rx, corpus, flags=re.IGNORECASE):
-            found.append(label)
-    return found[:3]
-
-def short_recap(uid: int) -> str:
-    themes = summarize_themes_from_history(uid)
-    if not themes:
-        return "Пока вижу только текущие сообщения. Коротко напомни тему — и продолжу."
-    if len(themes) == 1:
-        return f"Да, помню. Вкратце: говорили про «{themes[0]}»."
-    return "Да, помню. Вкратце: говорили про " + ", ".join(f"«{t}»" for t in themes) + "."
-
 # ---- Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
@@ -95,7 +31,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Live-поиск (через Tavily)
+# Live-поиск (через Tavily) — опционально
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 # Админ
@@ -103,20 +39,19 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
 
 # Персистентные файлы
 USERS_DB_PATH = os.getenv("USERS_DB_PATH", "users_limits.json")
-ANALYTICS_DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics_events.jsonl")
 HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "chat_history.json")
 
 # --- Google Sheets ENV ---
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON одной строкой (или base64)
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
-SHEETS_WORKSHEET = os.getenv("SHEETS_WORKSHEET", "Лист1")  # основной лист аналитики
+USERS_SHEET = os.getenv("USERS_SHEET", "Users")  # лист-реестр пользователей
 
 # --- HTTPX clients & timeouts (reuse) ---
 HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=15.0, pool=15.0)
 client_openai: httpx.AsyncClient | None = None
 client_http: httpx.AsyncClient | None = None
 
-# Белый список (VIP) — пользователи без лимитов
+# Белый список (VIP) — пользователи без ограничений
 WL_RAW = os.getenv("WHITELIST_USERS", "557891018,1942344627")
 try:
     WHITELIST_USERS = {int(x) for x in WL_RAW.split(",") if x.strip().isdigit()}
@@ -132,15 +67,15 @@ dp = Dispatcher()
 
 # ================== USERS (персистентно) =================
 USERS: dict[int, dict] = {}
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 
 def _serialize_user(u: dict) -> dict:
     return {
-        "free_used": int(u.get("free_used", 0)),
-        "plan": u.get("plan", "free"),
+        "plan": u.get("plan", "trial"),
         "paid_until": u["paid_until"].isoformat() if u.get("paid_until") else None,
         "lang": u.get("lang", "ru"),
         "topic": u.get("topic"),
-        "live": bool(u.get("live", False)),  # оставлено для совместимости
+        "registered_to_sheets": bool(u.get("registered_to_sheets", False)),
     }
 
 def save_users():
@@ -166,37 +101,48 @@ def load_users():
             except Exception:
                 paid_until = None
             USERS[int(k)] = {
-                "free_used": int(v.get("free_used", 0)),
-                "plan": v.get("plan", "free"),
+                "plan": v.get("plan", "trial"),
                 "paid_until": paid_until,
                 "lang": v.get("lang", "ru"),
                 "topic": v.get("topic"),
-                "live": bool(v.get("live", False)),
+                "registered_to_sheets": bool(v.get("registered_to_sheets", False)),
             }
     except Exception:
         logging.exception("load_users failed")
         USERS = {}
 
 def has_active_sub(u: dict) -> bool:
-    return u["plan"] in ("start", "business", "pro") and u["paid_until"] and u["paid_until"] > datetime.utcnow()
+    # creative — платная подписка
+    if u.get("plan") == "creative" and u.get("paid_until") and u["paid_until"] > datetime.utcnow():
+        return True
+    # trial — 7 дней
+    if u.get("plan", "trial") == "trial" and u.get("paid_until") and u["paid_until"] > datetime.utcnow():
+        return True
+    return False
 
 def get_user(tg_id: int):
     is_new = tg_id not in USERS
     if is_new:
-        USERS[tg_id] = {"free_used": 0, "plan": "free", "paid_until": None, "lang": "ru", "topic": None, "live": False}
+        USERS[tg_id] = {
+            "plan": "trial",
+            "paid_until": datetime.utcnow() + timedelta(days=TRIAL_DAYS),
+            "lang": "ru",
+            "topic": None,
+            "registered_to_sheets": False,
+        }
         save_users()
-        # Метрика количества пользователей — в фоне
+        # без лишней аналитики — только реестр в Sheets (асинхронно)
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(_metrics_users_count_async())
+            loop.create_task(_sheets_register_user_async(tg_id))
         except RuntimeError:
             pass
     return USERS[tg_id]
 
 def pay_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оформить «Старт»", callback_data="subscribe_start")],
-        [InlineKeyboardButton(text="ℹ️ Тарифы", callback_data="show_tariffs")]
+        [InlineKeyboardButton(text="💳 Оплатить Creative ($10/мес)", callback_data="subscribe_creative")],
+        [InlineKeyboardButton(text="ℹ️ О тарифе", callback_data="show_tariffs")]
     ])
 
 # ================== ИСТОРИЯ ДИАЛОГА =================
@@ -225,18 +171,12 @@ def save_history():
 def reset_history(user_id: int):
     HISTORY.pop(user_id, None); save_history()
 
-def append_history(user_id: int, role: str, content: str, username: str | None = None, first_name: str | None = None):
+def append_history(user_id: int, role: str, content: str):
     lst = HISTORY.setdefault(user_id, [])
     lst.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
     if len(lst) > 20:
         del lst[: len(lst) - 20]
     save_history()
-    # Запись в Google Sheets — неблокирующая
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_sheets_append_history_async(user_id, role, content, username, first_name))
-    except RuntimeError:
-        pass
 
 def get_recent_history(user_id: int, max_chars: int = 6000) -> list[dict]:
     total = 0; picked = []
@@ -273,12 +213,7 @@ DENY_TEXT_UZ = "⛔ So‘rov rad etildi. Men faqat O‘zbekiston qonunchiligi do
 
 def is_uzbek(text: str) -> bool:
     t = text.lower()
-    # поддерживаем и прямой апостроф ' и типографский ’
     return bool(re.search(r"[ғқҳў]", t) or re.search(r"\b(ha|yo[’']q|iltimos|rahmat|salom)\b", t))
-
-def violates_policy(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(rx, t) for rx in ILLEGAL_PATTERNS)
 
 # ================== АНТИССЫЛКИ =================
 LINK_PAT = re.compile(r"https?://\S+")
@@ -288,50 +223,56 @@ SOURCES_BLOCK_PAT = re.compile(r"(?is)\n+источники:\s*.*$")
 def strip_links(text: str) -> str:
     if not text:
         return text
-    text = MD_LINK_PAT.sub(r"\1", text)      # markdown-ссылки -> текст
-    text = LINK_PAT.sub("", text)            # голые URL -> удалить
-    text = SOURCES_BLOCK_PAT.sub("", text)   # убрать хвост "Источники: ..."
+    text = MD_LINK_PAT.sub(r"\1", text)
+    text = LINK_PAT.sub("", text)
+    text = SOURCES_BLOCK_PAT.sub("", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
-# ================== ТАРИФЫ/ЛИМИТЫ =================
-FREE_LIMIT = 5
-TARIFFS = {
-    "start": {"title": "Старт", "price_uzs": 49_000,
-              "desc": ["До 100 сообщений/мес", "Краткие и понятные ответы", "Без генерации файлов и картинок"],
-              "active": True, "duration_days": 30},
-    "business": {"title": "Бизнес", "price_uzs": 119_000,
-                 "desc": ["До 500 сообщений/мес", "Инструкции и чек-листы", "Простые документы (docx/pdf)"],
-                 "active": False, "duration_days": 30},
-    "pro": {"title": "PRO", "price_uzs": 249_000,
-            "desc": ["Высокие лимиты", "Картинки и сложные документы", "Приоритетная очередь"],
-            "active": False, "duration_days": 30},
+# ================== ТАРИФ =================
+TARIFF = {
+    "creative": {
+        "title": "Creative",
+        "price_usd": 10,
+        "desc_ru": [
+            "Генерация картинок и помощь с документами",
+            "Неограниченное число сообщений",
+            "Удобно прямо в Telegram",
+        ],
+        "desc_uz": [
+            "Rasm generatsiyasi va hujjatlar bo‘yicha yordam",
+            "Cheklanmagan xabarlar soni",
+            "Telegram ichida qulay",
+        ],
+        "duration_days": 30,
+        "active": True,
+    }
 }
 
-TOPICS = {
-    "daily":   {"title_ru": "Быт", "title_uz": "Maishiy", "hint": "Практичные советы, чек-листы и шаги."},
-    "finance": {"title_ru": "Финансы", "title_uz": "Moliya", "hint": "Объясняй с цифрами и примерами. Без рискованных персональных рекомендаций."},
-    "gov":     {"title_ru": "Госуслуги", "title_uz": "Davlat xizmatlari", "hint": "Опиши процедуру, документы и шаги подачи."},
-    "biz":     {"title_ru": "Бизнес", "title_uz": "Biznes", "hint": "Краткие инструкции по регистрации/отчётности/документам."},
-    "edu":     {"title_ru": "Учёба", "title_uz": "Ta’lim", "hint": "Расскажи про поступление/обучение и шаги."},
-    "it":      {"title_ru": "IT", "title_uz": "IT", "hint": "Технически и конкретно. Не советуй ничего незаконного."},
-    "health":  {"title_ru": "Здоровье (общ.)", "title_uz": "Sog‘liq (umumiy)", "hint": "Только общая информация. Советуй обращаться к врачу."},
-}
+def tariffs_text(lang='ru'):
+    t = TARIFF["creative"]
+    badge = "(доступен)" if t["active"] else "(скоро)"
+    if lang == "uz":
+        lines = "\n".join(f"• {x}" for x in t["desc_uz"])
+        return (
+            f"⭐ {t['title']} {badge}\n"
+            f"NARX: ${t['price_usd']}/oy\n"
+            f"{lines}\n\n"
+            f"7 kunlik BEPUL sinov → keyin ${t['price_usd']}/oy"
+        )
+    else:
+        lines = "\n".join(f"• {x}" for x in t["desc_ru"])
+        return (
+            f"⭐ {t['title']} {badge}\n"
+            f"Цена: ${t['price_usd']}/мес\n"
+            f"{lines}\n\n"
+            f"7 дней БЕСПЛАТНО → далее ${t['price_usd']}/мес"
+        )
 
-def topic_kb(lang="ru", current=None):
-    rows = []
-    for key, t in TOPICS.items():
-        label = t["title_uz"] if lang == "uz" else t["title_ru"]
-        if current == key:
-            label = f"✅ {label}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"topic:{key}")])
-    rows.append([InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="topic:close")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-# ================== SHEETS =================
+# ================== SHEETS (ТОЛЬКО РЕЕСТР ПОЛЬЗОВАТЕЛЕЙ) =================
 _sheets_client: gspread.Client | None = None
-_sheets_ws: gspread.Worksheet | None = None
+_users_ws: gspread.Worksheet | None = None
 LAST_SHEETS_ERROR: str | None = None
 
 def _ts() -> str:
@@ -346,58 +287,36 @@ def _open_spreadsheet():
         logging.exception("open_by_key failed")
         return None
 
-def _history_ws():
+def _users_ws():
     sh = _open_spreadsheet()
     if not sh:
         return None
     try:
-        return sh.worksheet("History")
+        return sh.worksheet(USERS_SHEET)
     except gspread.WorksheetNotFound:
         try:
-            # ⬇️ Шапка History с нормальными колонками
-            ws = sh.add_worksheet(title="History", rows=50000, cols=6)
-            ws.append_row(["ts", "user_id", "username", "first_name", "role", "content"], value_input_option="RAW")
+            ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=8)
+            ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until"], value_input_option="RAW")
             return ws
         except Exception:
-            logging.exception("Create History ws failed")
+            logging.exception("Create Users ws failed")
             return None
     except Exception:
-        logging.exception("_history_ws failed")
-        return None
-
-def _metrics_ws():
-    sh = _open_spreadsheet()
-    if not sh:
-        return None
-    try:
-        return sh.worksheet("Metrics")
-    except gspread.WorksheetNotFound:
-        try:
-            ws = sh.add_worksheet(title="Metrics", rows=10000, cols=3)
-            ws.append_row(["ts", "total_users", "active_subs"], value_input_option="RAW")
-            return ws
-        except Exception:
-            logging.exception("Create Metrics ws failed")
-            return None
-    except Exception:
-        logging.exception("_metrics_ws failed")
+        logging.exception("_users_ws failed")
         return None
 
 def _init_sheets():
     """
-    Жёсткая инициализация Google Sheets:
+    Минимальная инициализация Sheets:
     - поддержка raw JSON и base64
     - нормализация private_key с \\n -> \n
-    - добавлен Drive-scope
-    - создаём листы и заголовки при отсутствии
+    - создаём лист Users и заголовки при отсутствии
     """
-    global _sheets_client, _sheets_ws, LAST_SHEETS_ERROR
-
-    if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and SHEETS_WORKSHEET):
-        LAST_SHEETS_ERROR = "Sheets env not set: GOOGLE_CREDENTIALS / SHEETS_SPREADSHEET_ID / SHEETS_WORKSHEET"
-        logging.error(LAST_SHEETS_ERROR)
+    global _sheets_client, _users_ws, LAST_SHEETS_ERROR
+    if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and USERS_SHEET):
+        LAST_SHEETS_ERROR = "Sheets env not set: GOOGLE_CREDENTIALS / SHEETS_SPREADSHEET_ID / USERS_SHEET"
+        logging.warning(LAST_SHEETS_ERROR)
         return
-
     try:
         raw = GOOGLE_CREDENTIALS.strip()
         try:
@@ -407,14 +326,11 @@ def _init_sheets():
             creds_text = raw
 
         creds_info = json.loads(creds_text)
-
-        # Нормализуем private_key (если пришёл с литеральными \n)
         if isinstance(creds_info, dict) and creds_info.get("private_key"):
             pk = creds_info["private_key"]
             if "BEGIN PRIVATE KEY" in pk and "\\n" in pk:
                 creds_info["private_key"] = pk.replace("\\n", "\n")
 
-        # Базовая валидация
         for field in ("client_email", "private_key"):
             if not creds_info.get(field):
                 raise ValueError(f"GOOGLE_CREDENTIALS is missing '{field}'")
@@ -428,150 +344,78 @@ def _init_sheets():
 
         sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
         try:
-            _sheets_ws = sh.worksheet(SHEETS_WORKSHEET)
+            _users_ws = sh.worksheet(USERS_SHEET)
         except gspread.WorksheetNotFound:
-            logging.warning("Worksheet '%s' not found, creating…", SHEETS_WORKSHEET)
-            _sheets_ws = sh.add_worksheet(title=SHEETS_WORKSHEET, rows=2000, cols=20)
-            _sheets_ws.append_row(
-                ["ts", "user_id", "event", "topic", "live", "time_sensitive", "mode", "extra"],
-                value_input_option="RAW"
-            )
-
-        # убедимся, что служебные листы существуют
-        _ = _history_ws()
-        _ = _metrics_ws()
+            logging.warning("Worksheet '%s' not found, creating…", USERS_SHEET)
+            _users_ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=8)
+            _users_ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until"], value_input_option="RAW")
 
         LAST_SHEETS_ERROR = None
-        logging.info("Sheets OK: spreadsheet=%s worksheet=%s", SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET)
+        logging.info("Sheets OK: spreadsheet=%s users_sheet=%s", SHEETS_SPREADSHEET_ID, USERS_SHEET)
 
     except Exception as e:
         LAST_SHEETS_ERROR = f"{type(e).__name__}: {e}"
         logging.exception("Sheets init failed")
-        _sheets_client = _sheets_ws = None
+        _sheets_client = _users_ws = None
 
-async def _sheets_append_async(row: dict):
-    """Неблокирующая запись строки аналитики в основной лист (по колонкам)."""
-    if not _sheets_ws:
+async def _sheets_register_user_async(user_id: int):
+    """Разовая запись пользователя в лист Users (если ещё не записан)."""
+    u = USERS.get(user_id)
+    if not u or not _users_ws:
+        return
+    if u.get("registered_to_sheets"):
         return
     try:
         def _do():
-            _sheets_ws.append_row(
-                [
-                    row.get("ts", ""),
-                    str(row.get("user_id", "")),
-                    row.get("event", ""),
-                    str(row.get("topic", "")),
-                    "1" if row.get("live") else "0",
-                    "1" if row.get("time_sensitive") else "0",
-                    row.get("mode", ""),
-                    json.dumps(
-                        {k: v for k, v in row.items()
-                         if k not in {"ts", "user_id", "event", "topic", "live", "time_sensitive", "mode"}},
-                        ensure_ascii=False, separators=(",", ":")
-                    ),
-                ],
-                value_input_option="RAW",
-            )
-        await asyncio.to_thread(_do)
-    except Exception as e:
-        logging.warning("Sheets append failed: %s", e)
-
-async def _sheets_append_history_async(
-    user_id: int, role: str, content: str, username: str | None = None, first_name: str | None = None
-):
-    """Неблокирующая запись сообщения в лист History (по колонкам)."""
-    try:
-        def _do():
-            ws = _history_ws()
+            ws = _users_ws()
             if not ws:
                 return
+            # Пишем текущие данные
+            paid = u['paid_until'].isoformat() if u.get('paid_until') else ""
+            username = ""
+            first_name = ""
+            last_name = ""
+            # Эти поля обновим при первом сообщении (см. handle_text)
             ws.append_row(
-                [datetime.utcnow().isoformat(), str(user_id), username or "", first_name or "", role, content],
+                [datetime.utcnow().isoformat(), str(user_id), username, first_name, last_name, u.get('lang', 'ru'), u.get('plan', 'trial'), paid],
+                value_input_option="RAW"
+            )
+        await asyncio.to_thread(_do)
+        u["registered_to_sheets"] = True
+        save_users()
+    except Exception:
+        logging.exception("sheets_register_user failed")
+
+async def _sheets_update_user_row_async(user_id: int, username: str, first_name: str, last_name: str, lang: str, plan: str, paid_until: datetime | None):
+    """Пробуем обновить последнюю строку пользователя (упрощённо: просто добавляем новую обновлённую строку)."""
+    if not _users_ws:
+        return
+    try:
+        def _do():
+            ws = _users_ws()
+            if not ws:
+                return
+            paid = paid_until.isoformat() if paid_until else ""
+            ws.append_row(
+                [datetime.utcnow().isoformat(), str(user_id), username or "", first_name or "", last_name or "", lang or "ru", plan or "", paid],
                 value_input_option="RAW"
             )
         await asyncio.to_thread(_do)
     except Exception:
-        logging.exception("append_history: sheets write failed")
-
-async def _metrics_users_count_async():
-    """Неблокирующая запись количества пользователей и активных подписок в лист Metrics."""
-    try:
-        def _do():
-            ws = _metrics_ws()
-            if not ws:
-                return
-            total_users = len(USERS)
-            active_subs = sum(1 for u in USERS.values() if has_active_sub(u))
-            ws.append_row([datetime.utcnow().isoformat(), total_users, active_subs], value_input_option="RAW")
-        await asyncio.to_thread(_do)
-    except Exception:
-        logging.exception("metrics users count failed")
-
-# ================== АНАЛИТИКА (file + Sheets) =================
-def _log_to_file(row: dict):
-    try:
-        p = Path(ANALYTICS_DB_PATH); p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logging.warning("log_event file failed: %s", e)
-
-def log_event(user_id: int, name: str, **payload):
-    row = {"ts": _ts(), "user_id": user_id, "event": name, **payload}
-    _log_to_file(row)
-    # Google Sheets — в фоне, не блокируем обработчик
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_sheets_append_async(row))
-    except RuntimeError:
-        pass
-
-def format_stats(days: int | None = 7):
-    p = Path(ANALYTICS_DB_PATH)
-    if not p.exists():
-        return "Пока нет событий."
-    cutoff = datetime.utcnow() - timedelta(days=days) if days else None
-    evs = []
-    for line in p.read_text("utf-8").splitlines():
-        try:
-            e = json.loads(line)
-            if cutoff:
-                try:
-                    ts = datetime.fromisoformat((e.get("ts", "") or "").split("+")[0])
-                    if ts < cutoff:
-                        continue
-                except Exception:
-                    pass
-            evs.append(e)
-        except Exception:
-            continue
-    total = len(evs)
-    users = len({e.get("user_id") for e in evs if "user_id" in e})
-    qs = [e for e in evs if e.get("event") == "question"]
-    topics = Counter((e.get("topic") or "—") for e in qs)
-    grants = sum(1 for e in evs if e.get("event") == "subscription_granted")
-    paid_clicks = sum(1 for e in evs if e.get("event") == "paid_done_click")
-    active_now = sum(1 for u in USERS.values() if has_active_sub(u))
-    lines = [
-        f"📊 Статистика за {days} дн.",
-        f"• Событий: {total} | Уник. пользователей: {users}",
-        f"• Вопросов: {len(qs)} | Live-использований: {sum(1 for e in qs if e.get('live'))}",
-        f"• Топ тем: " + (", ".join(f"{k}:{v}" for k, v in topics.most_common(6)) if topics else "—"),
-        f"• Кнопка «Оплатил»: {paid_clicks} | Активаций подписки: {grants}",
-        f"• Активных подписок сейчас: {active_now}",
-    ]
-    return "\n".join(lines)
+        logging.exception("sheets_update_user_row failed")
 
 # ================== ИИ =================
 BASE_SYSTEM_PROMPT = (
-    "Ты — SavolBot, дружелюбный и быстрый собеседник. Отвечай естественно, как человек: кратко и ясно "
-    "(обычно до 6–8 предложений), без канцелярита, с примерами и списками, когда это уместно. "
-    "Можно лёгкий юмор, но по теме. Соблюдай законы Узбекистана. Не давай инструкций для незаконных действий. "
-    "По медицине — только общая справка и рекомендация обратиться к врачу. Язык ответа = язык вопроса (RU/UZ). "
-    "Никогда не вставляй ссылки и URL. Не говори фразы вроде «я не помню/не сохраняю историю». "
+    "Ты — SavolBot (часть TripleA). Отвечай естественно и по делу: 6–8 предложений, без канцелярита, "
+    "с примерами и списками по месту. Лёгкий юмор допустим. Соблюдай законы Узбекистана. "
+    "Не давай инструкций для незаконных действий. По медицине — только общая справка и совет обратиться к врачу. "
+    "Язык ответа = язык вопроса (RU/UZ). Никогда не вставляй ссылки и URL. "
     "Если контекста мало — вежливо попроси напомнить ключевые детали и продолжай. "
     "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами."
 )
+
+def strip_links_and_cleanup(text: str) -> str:
+    return strip_links(text or "")
 
 async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
     if not OPENAI_API_KEY:
@@ -586,9 +430,8 @@ async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
     r = await client_openai.post("/chat/completions", headers=headers, json=payload)
     r.raise_for_status()
     raw = r.json()["choices"][0]["message"]["content"].strip()
-    return strip_links(raw)
+    return strip_links_and_cleanup(raw)
 
-# ================== LIVE SEARCH =================
 TIME_SENSITIVE_PATTERNS = [
     r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
     r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
@@ -639,168 +482,155 @@ async def web_search_tavily(query: str, max_results: int = 3) -> dict | None:
 async def answer_with_live_search(user_text: str, topic_hint: str | None, user_id: int) -> str:
     c = cache_get(user_text)
     if c:
-        return c  # без служебной приписки
-
+        return c
     data = await web_search_tavily(user_text)
     if not data:
         return await ask_gpt(user_text, topic_hint, user_id)
-
     snippets = []
     for it in (data.get("results") or [])[:3]:
         title = (it.get("title") or "")[:80]
         content = (it.get("content") or "")[:350]
         snippets.append(f"- {title}\n{content}")
-
     system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
     if topic_hint:
         system += f" Учитывай контекст темы: {topic_hint}"
     user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
-
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.3,
-        "messages": build_messages(user_id, system, user_aug),
-    }
+    payload = {"model": OPENAI_MODEL, "temperature": 0.3, "messages": build_messages(user_id, system, user_aug)}
     r = await client_openai.post("/chat/completions", headers=headers, json=payload)
     r.raise_for_status()
     answer = r.json()["choices"][0]["message"]["content"].strip()
-
-    final = strip_links(answer)
+    final = strip_links_and_cleanup(answer)
     cache_set(user_text, final)
     return final
 
+# ================== ВСПОМОГАТЕЛЬНОЕ: эффект «думаю…» =================
+async def send_thinking_progress(message: Message) -> Message:
+    """Отправляет сообщение-прогресс и возвращает его для последующего редактирования."""
+    try:
+        m = await message.answer("⏳ Думаю…")
+        # небольшая плавная смена статуса
+        await asyncio.sleep(0.6)
+        await m.edit_text("🔎 Собираю информацию…")
+        return m
+    except Exception:
+        # если не получилось отредактировать — просто вернём исходное
+        return await message.answer("🔎 Собираю информацию…")
+
 # ================== КОМАНДЫ =================
-def tariffs_text(lang='ru'):
-    def bullet(lines): return "\n".join(f"• {x}" for x in lines)
-    txt = []
-    for key in ("start", "business", "pro"):
-        t = TARIFFS[key]
-        badge = "(доступен)" if t["active"] else "(скоро)"
-        if lang == "uz":
-            badge = "(faol)" if t["active"] else "(tez orada)"
-            txt.append(
-                f"⭐ {t['title']} {badge}\n"
-                f"NARX: {t['price_uzs']:,} so‘m/oy\n"
-                f"{bullet(t['desc'])}"
-            )
-        else:
-            txt.append(
-                f"⭐ {t['title']} {badge}\n"
-                f"Цена: {t['price_uzs']:,} сум/мес\n"
-                f"{bullet(t['desc'])}"
-            )
-    return "\n\n".join(txt)
+WELCOME_RU = (
+    "👋 Привет! Я — SavolBot, часть команды TripleA.\n"
+    "Мы делаем автообзвоны, чат-боты и GPT в Telegram. "
+    "Наш плюс: удобный доступ к ChatGPT прямо в Telegram — всего за $10/мес (вместо $20 у официальной подписки).\n\n"
+    "Тариф: ⭐ Creative — генерирую картинки, помогаю с документами, без лимитов сообщений. "
+    "Сейчас действует 7-дневный бесплатный период. Потом — $10/мес.\n\n"
+    "Полезное: /tariffs — про тариф, /myplan — мой план, /topics — выбрать тему.\n"
+    "Пиши вопрос — начнём!"
+)
+WELCOME_UZ = (
+    "👋 Salom! Men — SavolBot, TripleA jamoasining qismi.\n"
+    "Biz avtoqo‘ng‘iroqlar, chat-botlar va Telegramda GPT xizmatlarini qilamiz. "
+    "Afzalligimiz: ChatGPT’ga Telegramning o‘zida qulay kirish — oyiga atigi $10 (rasmiy $20 o‘rniga).\n\n"
+    "Tarif: ⭐ Creative — suratlar generatsiyasi, hujjatlar bo‘yicha yordam, cheklanmagan xabarlar. "
+    "Hozir 7 kunlik bepul davr. Keyin — $10/oy.\n\n"
+    "Foydali: /tariffs — tarif, /myplan — rejam, /topics — mavzu tanlash.\n"
+    "Savolingizni yozing — boshlaymiz!"
+)
+
+TOPICS = {
+    "daily":   {"title_ru": "Быт", "title_uz": "Maishiy", "hint": "Практичные советы, чек-листы и шаги."},
+    "finance": {"title_ru": "Финансы", "title_uz": "Moliya", "hint": "Объясняй с цифрами и примерами. Без рискованных персональных рекомендаций."},
+    "gov":     {"title_ru": "Госуслуги", "title_uz": "Davlat xizmatlari", "hint": "Опиши процедуру, документы и шаги подачи."},
+    "biz":     {"title_ru": "Бизнес", "title_uz": "Biznes", "hint": "Краткие инструкции по регистрации/отчётности/документам."},
+    "edu":     {"title_ru": "Учёба", "title_uz": "Ta’lim", "hint": "Расскажи про поступление/обучение и шаги."},
+    "it":      {"title_ru": "IT", "title_uz": "IT", "hint": "Технически и конкретно. Не советуй ничего незаконного."},
+    "health":  {"title_ru": "Здоровье (общ.)", "title_uz": "Sog‘liq (umumiy)", "hint": "Только общая информация. Советуй обращаться к врачу."},
+}
+
+def topic_kb(lang="ru", current=None):
+    rows = []
+    for key, t in TOPICS.items():
+        label = t["title_uz"] if lang == "uz" else t["title_ru"]
+        if current == key:
+            label = f"✅ {label}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"topic:{key}")])
+    rows.append([InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="topic:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
     u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"; save_users()
-
-    # Логируем событие + историю со служебной метой
-    log_event(
-        message.from_user.id, "start",
-        lang=u["lang"],
-        username=message.from_user.username,
-        first_name=message.from_user.first_name
-    )
-    append_history(
-        message.from_user.id, "user", "/start",
-        username=message.from_user.username, first_name=message.from_user.first_name
-    )
-
-    if u["lang"] == "uz":
-        greet = (
-            f"👋 Assalomu alaykum!\n"
-            f"Biz — SavolBot, TripleA kompaniyasining bir qismi. Avtoqo‘ng‘iroqlar, chat-botlar va GPT’ni Telegram’ga ulaymiz.\n"
-            f"Afzallik: Telegramda ChatGPT — oyiga **$5** (rasmiy $20 o‘rniga). Dastlabki {FREE_LIMIT} javob — bepul.\n\n"
-            f"/topics — mavzuni tanlang.\n"
-            f"Kurs, yangilik yoki narxlar kabi dolzarb ma’lumotlar kerak bo‘lsa — avtomatik qidiraman."
-        )
-    else:
-        greet = (
-            f"👋 Привет!\n"
-            f"Мы — SavolBot, часть компании **TripleA**. Делаем автообзвоны, чат-боты и подключаем **GPT прямо в Telegram**.\n"
-            f"Наше преимущество: доступ к ChatGPT в Telegram за **$5/мес** (вместо официальных $20/мес). "
-            f"Первые {FREE_LIMIT} ответов — бесплатно.\n\n"
-            f"/topics — выберите тему.\n"
-            f"Если нужны актуальные данные (курс, новости, цены) — я подхвачу автоматически."
-        )
-    await message.answer(greet)
+    # Реестр в Sheets (если инициализированы env) — в фоне
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_register_user_async(message.from_user.id))
+    except RuntimeError:
+        pass
+    hello = WELCOME_UZ if u["lang"] == "uz" else WELCOME_RU
+    await message.answer(hello)
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    log_event(message.from_user.id, "help")
-    await message.answer(
-        "ℹ️ Пишите вопрос (RU/UZ). /topics — выбор темы.\n"
-        "Если вопрос про актуальные вещи (цены, курс, новости и т.п.) — я сам использую интернет-поиск.\n"
-        f"Первые {FREE_LIMIT} ответов — бесплатно; дальше /tariffs."
-    )
+    u = get_user(message.from_user.id)
+    txt = "ℹ️ Напишите вопрос (RU/UZ). Я умею генерировать картинки и помогать с документами.\n/tariffs — тариф, /myplan — план, /topics — тема." \
+        if u["lang"] == "ru" else \
+        "ℹ️ Savolingizni yozing (RU/UZ). Surat generatsiyasi va hujjatlar bo‘yicha yordam.\n/tariffs — tarif, /myplan — reja, /topics — mavzu."
+    await message.answer(txt)
 
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
-    log_event(message.from_user.id, "about")
+    u = get_user(message.from_user.id)
     txt = (
-        "🤖 SavolBot — часть TripleA. Мы делаем автообзвоны, чат-боты и подключаем GPT прямо в Telegram.\n"
-        "Почему с нами выгодно: ChatGPT в Telegram за **$5/мес** вместо официальных **$20/мес**.\n"
-        "Хотите для бизнеса? Поможем с голосовыми обзвонами, ботами и интеграциями. Подробнее — /tariffs."
+        "🤖 SavolBot от TripleA: автообзвоны, чат-боты и GPT в Telegram. "
+        "Creative — $10/мес, 7 дней бесплатно. /tariffs"
+        if u["lang"] == "ru"
+        else "🤖 SavolBot (TripleA): avtoqo‘ng‘iroqlar, chat-botlar, Telegramda GPT. "
+             "Creative — $10/oy, 7 kun bepul. /tariffs"
     )
     await message.answer(txt)
 
 @dp.message(Command("tariffs"))
 async def cmd_tariffs(message: Message):
     u = get_user(message.from_user.id)
-    log_event(message.from_user.id, "view_tariffs")
     await message.answer(tariffs_text(u["lang"]), reply_markup=pay_kb())
 
 @dp.message(Command("myplan"))
 async def cmd_myplan(message: Message):
     u = get_user(message.from_user.id)
     status = "активна" if has_active_sub(u) else "нет"
-    until = u["paid_until"].isoformat() if u["paid_until"] else "—"
+    until = u["paid_until"].isoformat() if u.get("paid_until") else "—"
     topic = u.get("topic") or "—"
     is_wl = is_whitelisted(message.from_user.id)
-    plan_label = "whitelist (безлимит)" if is_wl else u["plan"]
-    free_info = "безлимит" if is_wl else f"{u['free_used']}/{FREE_LIMIT}"
-    log_event(message.from_user.id, "myplan_open", whitelisted=is_wl)
+    plan_label = "whitelist (безлимит)" if is_wl else u.get("plan", "trial")
     await message.answer(
-        f"Ваш план: {plan_label}\n"
-        f"Подписка: {status} (до {until})\n"
-        f"Тема: {topic}\n"
-        f"Бесплатно: {free_info}"
+        f"Ваш план: {plan_label}\nПодписка активна: {status} (до {until})\nТема: {topic}"
+        if u["lang"] == "ru" else
+        f"Rejangiz: {plan_label}\nFaollik: {status} (gacha {until})\nMavzu: {topic}"
     )
 
 @dp.message(Command("topics"))
 async def cmd_topics(message: Message):
     u = get_user(message.from_user.id); lang = u["lang"]
-    log_event(message.from_user.id, "topics_open")
     head = "🗂 Выберите тему:" if lang == "ru" else "🗂 Mavzuni tanlang:"
     await message.answer(head, reply_markup=topic_kb(lang, current=u.get("topic")))
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if ADMIN_CHAT_ID and str(message.from_user.id) != str(ADMIN_CHAT_ID):
-        return await message.answer("Команда доступна администратору.")
-    parts = message.text.strip().split()
-    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
-    await message.answer(format_stats(days))
 
 @dp.message(Command("new"))
 async def cmd_new(message: Message):
     reset_history(message.from_user.id)
-    await message.answer("🧹 Контекст очищен. Начинаем новую тему.")
+    await message.answer("🧹 Контекст очищен. Начинаем новую тему." if get_user(message.from_user.id)["lang"] == "ru" else "🧹 Kontekst tozalandi. Yangi mavzu.")
 
-# -------- Sheets диагностика/починка ----------
+# -------- Sheets диагностика ----------
 @dp.message(Command("gs_debug"))
 async def cmd_gs_debug(message: Message):
-    has_env = all([GOOGLE_CREDENTIALS, SHEETS_SPREADSHEET_ID, SHEETS_WORKSHEET])
+    has_env = all([GOOGLE_CREDENTIALS, SHEETS_SPREADSHEET_ID, USERS_SHEET])
     await message.answer(
-        "ENV OK: {env}\nID: {sid}\nWS: {ws}\nCred len: {cl}\nSheets inited: {ok}\nErr: {err}".format(
+        "ENV OK: {env}\nID: {sid}\nUsers WS: {ws}\nCred len: {cl}\nUsers inited: {ok}\nErr: {err}".format(
             env=has_env,
             sid=SHEETS_SPREADSHEET_ID or "—",
-            ws=SHEETS_WORKSHEET or "—",
+            ws=USERS_SHEET or "—",
             cl=len(GOOGLE_CREDENTIALS or ""),
-            ok=bool(_sheets_ws),
+            ok=bool(_users_ws),
             err=LAST_SHEETS_ERROR or "—",
         )
     )
@@ -808,88 +638,49 @@ async def cmd_gs_debug(message: Message):
 @dp.message(Command("gs_reinit"))
 async def cmd_gs_reinit(message: Message):
     _init_sheets()
-    await message.answer("Reinit → " + ("✅ OK" if _sheets_ws else f"❌ Fail: {LAST_SHEETS_ERROR}"))
+    await message.answer("Reinit → " + ("✅ OK" if _users_ws else f"❌ Fail: {LAST_SHEETS_ERROR}"))
 
-@dp.message(Command("gs_test"))
-async def cmd_gs_test(message: Message):
-    if not _sheets_ws:
-        return await message.answer("❌ Sheets не инициализирован. Сначала /gs_debug и поправь ENV.")
-    try:
-        await _sheets_append_async({
-            "ts": datetime.utcnow().isoformat(),
-            "user_id": message.from_user.id,
-            "event": "gs_test",
-            "topic": "",
-            "live": False,
-            "time_sensitive": False,
-            "mode": "manual",
-        })
-        await message.answer("✅ Записал тестовую строку в Google Sheets.")
-    except Exception:
-        logging.exception("gs_test append failed")
-        await message.answer("❌ Не смог записать в Google Sheets. Смотри логи.")
-
-@dp.message(Command("gs_list"))
-async def cmd_gs_list(message: Message):
+@dp.message(Command("gs_users"))
+async def cmd_gs_users(message: Message):
     try:
         if not _sheets_client:
-            return await message.answer("❌ Sheets client не инициализирован. Перезапусти и /gs_reinit.")
+            return await message.answer("❌ Sheets client не инициализирован. /gs_reinit")
         sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
         titles = [ws.title for ws in sh.worksheets()]
         await message.answer("Листы в таблице:\n" + "\n".join("• " + t for t in titles))
     except Exception as e:
-        logging.exception("gs_list failed")
-        await message.answer(f"❌ gs_list ошибка: {e}")
+        logging.exception("gs_users failed")
+        await message.answer(f"❌ gs_users ошибка: {e}")
 
-@dp.message(Command("gs_try"))
-async def cmd_gs_try(message: Message):
-    try:
-        if not _sheets_client:
-            return await message.answer("❌ Sheets client не инициализирован. /gs_reinit")
-        await _sheets_append_async({
-            "ts": datetime.utcnow().isoformat(),
-            "user_id": message.from_user.id,
-            "event": "gs_try",
-            "topic": "",
-            "live": False,
-            "time_sensitive": False,
-            "mode": "manual",
-        })
-        await message.answer("✅ Записал строку в активный лист.")
-    except Exception as e:
-        logging.exception("gs_try failed")
-        await message.answer(f"❌ gs_try ошибка: {e}")
-
-# ================== CALLBACKS =================
+# ================== CALLBACKS (оплата) =================
 @dp.callback_query(F.data == "show_tariffs")
 async def cb_show_tariffs(call: CallbackQuery):
     u = get_user(call.from_user.id)
-    log_event(call.from_user.id, "view_tariffs_click")
     await call.message.edit_text(tariffs_text(u["lang"]), reply_markup=pay_kb())
     await call.answer()
 
-@dp.callback_query(F.data == "subscribe_start")
-async def cb_subscribe_start(call: CallbackQuery):
-    log_event(call.from_user.id, "subscribe_start_open")
-    pay_link = "https://pay.example.com/savolbot/start"  # заглушка
+@dp.callback_query(F.data == "subscribe_creative")
+async def cb_subscribe_creative(call: CallbackQuery):
+    # Заглушка — заменишь ссылку на реальную
+    pay_link = "https://pay.example.com/savolbot/creative"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Готово (я оплатил)", callback_data="paid_start_done")]
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data="paid_creative_done")]
     ])
-    await call.message.answer(
-        f"💳 «Старт» — {TARIFFS['start']['price_uzs']:,} сум/мес.\nОплата: {pay_link}",
-        reply_markup=kb
+    txt = (
+        f"💳 Тариф ⭐ Creative — ${TARIFF['creative']['price_usd']}/мес.\nОплата: {pay_link}\n"
+        f"После оплаты нажмите кнопку ниже."
     )
+    await call.message.answer(txt, reply_markup=kb)
     await call.answer()
 
-@dp.callback_query(F.data == "paid_start_done")
+@dp.callback_query(F.data == "paid_creative_done")
 async def cb_paid_done(call: CallbackQuery):
-    log_event(call.from_user.id, "paid_done_click")
     if ADMIN_CHAT_ID and bot:
         try:
             await bot.send_message(
                 int(ADMIN_CHAT_ID),
-                f"👤 @{call.from_user.username or call.from_user.id} запросил активацию «Старт».\n"
-                f"TG ID: {call.from_user.id}\nИспользуйте /grant_start {call.from_user.id}"
+                f"👤 @{call.from_user.username or call.from_user.id} запросил активацию «Creative».\n"
+                f"TG ID: {call.from_user.id}\nИспользуйте /grant_creative {call.from_user.id}"
             )
         except Exception:
             logging.exception("Notify admin failed")
@@ -909,79 +700,99 @@ async def cb_topic(call: CallbackQuery):
     if key in TOPICS:
         u["topic"] = key; save_users()
         lang = u["lang"]; title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
-        log_event(call.from_user.id, "topic_select", topic=key)
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
         await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
 
-@dp.message(Command("grant_start"))
-async def cmd_grant_start(message: Message):
+# ================== АДМИН: активация подписки =================
+@dp.message(Command("grant_creative"))
+async def cmd_grant_creative(message: Message):
     if str(message.from_user.id) != str(ADMIN_CHAT_ID):
         return await message.answer("Команда недоступна.")
     parts = message.text.strip().split()
     if len(parts) != 2 or not parts[1].isdigit():
-        return await message.answer("Использование: /grant_start <tg_id>")
+        return await message.answer("Использование: /grant_creative <tg_id>")
     target_id = int(parts[1]); u = get_user(target_id)
-    u["plan"] = "start"
-    u["paid_until"] = datetime.utcnow() + timedelta(days=TARIFFS["start"]["duration_days"]); save_users()
-    log_event(message.from_user.id, "subscription_granted", target=target_id, plan="start", paid_until=u["paid_until"].isoformat())
-    await message.answer(f"✅ Активирован «Старт» для {target_id} до {u['paid_until'].isoformat()}")
+    u["plan"] = "creative"
+    u["paid_until"] = datetime.utcnow() + timedelta(days=TARIFF["creative"]["duration_days"]); save_users()
+    await message.answer(f"✅ Активирован «Creative» для {target_id} до {u['paid_until'].isoformat()}")
     try:
         if bot:
-            await bot.send_message(target_id, "✅ Подписка «Старт» активирована. Приятного использования!")
+            await bot.send_message(target_id, "✅ Подписка «Creative» активирована. Приятного использования!")
+        # Запишем обновление статуса в Users лист
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_update_user_row_async(
+                target_id, "", "", "", get_user(target_id).get("lang","ru"), "creative", u["paid_until"]
+            ))
+        except RuntimeError:
+            pass
     except Exception:
         logging.warning("Notify user failed")
 
 # ================== ОБРАБОТЧИК ВОПРОСОВ =================
 @dp.message(F.text)
 async def handle_text(message: Message):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     uid = message.from_user.id
     u = get_user(uid)
 
+    # Язык
     if is_uzbek(text):
         u["lang"] = "uz"; save_users()
-    if violates_policy(text):
-        log_event(uid, "question_blocked", reason="policy")
-        return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
-    if (not is_whitelisted(uid)) and (not has_active_sub(u)) and u["free_used"] >= FREE_LIMIT:
-        log_event(uid, "paywall_shown")
-        return await message.answer("💳 Доступ к ответам ограничен. Оформите подписку:", reply_markup=pay_kb())
 
-    # ⬇️ Перехват «помнишь/вспомни» → краткое тематическое резюме
-    if any(re.search(rx, text.lower()) for rx in RECALL_PATTERNS):
-        recap = short_recap(uid)
-        await message.answer(recap)
-        append_history(uid, "user", text, username=message.from_user.username, first_name=message.from_user.first_name)
-        append_history(uid, "assistant", recap)
-        return
-    # ⬆️ Конец
+    # Политика
+    low = text.lower()
+    if any(re.search(rx, low) for rx in ILLEGAL_PATTERNS):
+        return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
+
+    # Проверка подписки / триала (если не в белом списке)
+    if (not is_whitelisted(uid)) and (not has_active_sub(u)):
+        return await message.answer(
+            "💳 Бесплатный период закончился. Подключите ⭐ Creative, чтобы продолжить:",
+            reply_markup=pay_kb()
+        )
+
+    # Сохраним идентификацию в Users-реестр (username/имя), чтобы саппорт вас находил
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_update_user_row_async(
+            uid,
+            (message.from_user.username or ""),
+            (message.from_user.first_name or ""),
+            (message.from_user.last_name or ""),
+            u.get("lang", "ru"),
+            u.get("plan", "trial"),
+            u.get("paid_until"),
+        ))
+    except RuntimeError:
+        pass
+
+    # Эффект «думаю…»
+    thinking_msg = await send_thinking_progress(message)
 
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    use_live = True  # или is_time_sensitive(text)
+    use_live = True  # можно сделать is_time_sensitive(text)
 
     try:
         reply = await (answer_with_live_search(text, topic_hint, uid)
                        if use_live else ask_gpt(text, topic_hint, uid))
-        reply = sanitize_answer(reply)
-        await message.answer(reply)
+        reply = strip_links_and_cleanup(reply)
 
-        # История в столбцах (с метой пользователя)
-        append_history(uid, "user", text, username=message.from_user.username, first_name=message.from_user.first_name)
+        # Редактируем плейсхолдер на итоговый ответ
+        try:
+            await thinking_msg.edit_text(reply)
+        except Exception:
+            await message.answer(reply)
+
+        append_history(uid, "user", text)
         append_history(uid, "assistant", reply)
 
-        # Аналитика с метаданными
-        preview = (text[:120] + "…") if len(text) > 120 else text
-        log_event(uid, "question",
-                  topic=u.get("topic"), live=use_live, time_sensitive=is_time_sensitive(text),
-                  whitelisted=is_whitelisted(uid),
-                  username=message.from_user.username, first_name=message.from_user.first_name,
-                  text_preview=preview)
     except Exception:
         logging.exception("OpenAI error")
-        return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
-
-    if (not is_whitelisted(uid)) and (not has_active_sub(u)):
-        u["free_used"] += 1; save_users()
+        try:
+            await thinking_msg.edit_text("Извини, сервер перегружен. Попробуйте позже.")
+        except Exception:
+            await message.answer("Извини, сервер перегружен. Попробуйте позже.")
 
 # ================== Lifespan (инициализация/закрытие) =================
 @asynccontextmanager
@@ -990,7 +801,6 @@ async def lifespan(app: FastAPI):
     load_history()
     _init_sheets()
 
-    # HTTP/2 включаем только если реально доступен и явно включён флагом
     HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "0") == "1"
     try:
         import h2  # noqa: F401
@@ -1003,7 +813,7 @@ async def lifespan(app: FastAPI):
     client_openai = httpx.AsyncClient(base_url=OPENAI_API_BASE, timeout=HTTPX_TIMEOUT, http2=use_http2)
     client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=use_http2)
 
-    # Ставим вебхук на старте
+    # Вебхук на старте
     if TELEGRAM_TOKEN and WEBHOOK_URL and client_http:
         try:
             resp = await client_http.post(
@@ -1019,13 +829,6 @@ async def lifespan(app: FastAPI):
             logging.info("setWebhook: %s %s", resp.status_code, resp.text)
         except Exception:
             logging.exception("Failed to set webhook")
-
-    # Запишем текущий счётчик пользователей в Metrics
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_metrics_users_count_async())
-    except RuntimeError:
-        pass
 
     try:
         yield
