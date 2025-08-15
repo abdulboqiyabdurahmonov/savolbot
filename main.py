@@ -4,12 +4,14 @@ import json
 import time
 import logging
 import asyncio
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections import Counter
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import httpx
+from httpx import HTTPError, HTTPStatusError
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -47,9 +49,14 @@ SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 USERS_SHEET = os.getenv("USERS_SHEET", "Users")  # лист-реестр пользователей
 
 # --- HTTPX clients & timeouts (reuse) ---
-HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=15.0, pool=15.0)
-client_openai: httpx.AsyncClient | None = None
-client_http: httpx.AsyncClient | None = None
+# Усиленные таймауты для устойчивости
+HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=30.0)
+client_openai: Optional[httpx.AsyncClient] = None
+client_http: Optional[httpx.AsyncClient] = None
+
+# Параллелизм запросов к модели (чтобы не ловить 429)
+MODEL_CONCURRENCY = int(os.getenv("MODEL_CONCURRENCY", "4"))
+_model_sem = asyncio.Semaphore(MODEL_CONCURRENCY)
 
 # Белый список (VIP) — пользователи без ограничений
 WL_RAW = os.getenv("WHITELIST_USERS", "557891018,1942344627")
@@ -230,6 +237,9 @@ def strip_links(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
+def strip_links_and_cleanup(text: str) -> str:
+    return strip_links(text or "")
+
 # ================== ТАРИФ =================
 TARIFF = {
     "creative": {
@@ -271,9 +281,9 @@ def tariffs_text(lang='ru'):
         )
 
 # ================== SHEETS (ТОЛЬКО РЕЕСТР ПОЛЬЗОВАТЕЛЕЙ) =================
-_sheets_client: gspread.Client | None = None
-_users_ws: gspread.Worksheet | None = None
-LAST_SHEETS_ERROR: str | None = None
+_sheets_client: Optional[gspread.Client] = None
+_users_ws: Optional[gspread.Worksheet] = None
+LAST_SHEETS_ERROR: Optional[str] = None
 
 def _ts() -> str:
     return datetime.utcnow().isoformat()
@@ -287,7 +297,7 @@ def _open_spreadsheet():
         logging.exception("open_by_key failed")
         return None
 
-def _users_ws():
+def _users_ws_get():
     sh = _open_spreadsheet()
     if not sh:
         return None
@@ -367,15 +377,13 @@ async def _sheets_register_user_async(user_id: int):
         return
     try:
         def _do():
-            ws = _users_ws()
+            ws = _users_ws_get()
             if not ws:
                 return
-            # Пишем текущие данные
             paid = u['paid_until'].isoformat() if u.get('paid_until') else ""
             username = ""
             first_name = ""
             last_name = ""
-            # Эти поля обновим при первом сообщении (см. handle_text)
             ws.append_row(
                 [datetime.utcnow().isoformat(), str(user_id), username, first_name, last_name, u.get('lang', 'ru'), u.get('plan', 'trial'), paid],
                 value_input_option="RAW"
@@ -386,13 +394,13 @@ async def _sheets_register_user_async(user_id: int):
     except Exception:
         logging.exception("sheets_register_user failed")
 
-async def _sheets_update_user_row_async(user_id: int, username: str, first_name: str, last_name: str, lang: str, plan: str, paid_until: datetime | None):
-    """Пробуем обновить последнюю строку пользователя (упрощённо: просто добавляем новую обновлённую строку)."""
+async def _sheets_update_user_row_async(user_id: int, username: str, first_name: str, last_name: str, lang: str, plan: str, paid_until: Optional[datetime]):
+    """Упрощённо: добавляем обновлённую строку (последняя версия состояния пользователя)."""
     if not _users_ws:
         return
     try:
         def _do():
-            ws = _users_ws()
+            ws = _users_ws_get()
             if not ws:
                 return
             paid = paid_until.isoformat() if paid_until else ""
@@ -404,6 +412,55 @@ async def _sheets_update_user_row_async(user_id: int, username: str, first_name:
     except Exception:
         logging.exception("sheets_update_user_row failed")
 
+# ================== БЕЗОТКАЗНОСТЬ: retry + дружелюбные ошибки =================
+async def _retry(coro_factory, attempts=3, base_delay=0.8):
+    """
+    coro_factory: функция без аргументов, возвращающая coroutine (новый запрос на каждый заход).
+    Повторяем на 429/5xx/таймаутах с экспоненциальной паузой и джиттером.
+    """
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return await coro_factory()
+        except HTTPStatusError as e:
+            if e.response.status_code in (429, 500, 502, 503, 504):
+                last_exc = e
+            else:
+                raise
+        except (HTTPError, asyncio.TimeoutError) as e:
+            last_exc = e
+        await asyncio.sleep(base_delay * (2 ** i) + random.random() * 0.2)
+    if last_exc:
+        raise last_exc
+
+def _friendly_error_text(e, lang="ru"):
+    ru = {
+        "timeout": "⌛ Источник долго отвечает. Попробуйте повторить запрос чуть позже.",
+        "429": "⏳ Высокая нагрузка на модель. Повторите запрос через минуту.",
+        "401": "🔑 Проблема с ключом OpenAI. Сообщите поддержке.",
+        "402": "💳 Исчерпан лимит оплаты OpenAI. Сообщите поддержке.",
+        "5xx": "☁️ Поставщик временно недоступен. Повторите запрос позже.",
+        "generic": "Извини, не получилось получить ответ. Попробуй ещё раз.",
+    }
+    uz = {
+        "timeout": "⌛ Manba javob bermayapti. Birozdan so‘ng qayta urinib ko‘ring.",
+        "429": "⏳ Modelga yuklama yuqori. Bir daqiqadan so‘ng urinib ko‘ring.",
+        "401": "🔑 OpenAI kaliti muammosi. Texnik yordamga yozing.",
+        "402": "💳 OpenAI to‘lovi limiti tugagan. Texnik yordamga yozing.",
+        "5xx": "☁️ Xizmat vaqtincha ishlamayapti. Keyinroq urinib ko‘ring.",
+        "generic": "Kechirasiz, hozir javob bera olmadim. Yana urinib ko‘ring.",
+    }
+    M = uz if lang == "uz" else ru
+    if isinstance(e, HTTPStatusError):
+        code = e.response.status_code
+        if code == 429: return M["429"]
+        if code == 401: return M["401"]
+        if code == 402: return M["402"]
+        if 500 <= code <= 599: return M["5xx"]
+    if isinstance(e, (HTTPError, asyncio.TimeoutError)):
+        return M["timeout"]
+    return M["generic"]
+
 # ================== ИИ =================
 BASE_SYSTEM_PROMPT = (
     "Ты — SavolBot (часть TripleA). Отвечай естественно и по делу: 6–8 предложений, без канцелярита, "
@@ -414,10 +471,7 @@ BASE_SYSTEM_PROMPT = (
     "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами."
 )
 
-def strip_links_and_cleanup(text: str) -> str:
-    return strip_links(text or "")
-
-async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
+async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
     if not OPENAI_API_KEY:
         return f"Вы спросили: {user_text}"
     system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
@@ -427,10 +481,20 @@ async def ask_gpt(user_text: str, topic_hint: str | None, user_id: int) -> str:
         "temperature": 0.6,
         "messages": build_messages(user_id, system, user_text),
     }
-    r = await client_openai.post("/chat/completions", headers=headers, json=payload)
-    r.raise_for_status()
-    raw = r.json()["choices"][0]["message"]["content"].strip()
-    return strip_links_and_cleanup(raw)
+
+    async def _do():
+        return await client_openai.post("/chat/completions", headers=headers, json=payload)
+
+    try:
+        async with _model_sem:
+            r = await _retry(lambda: _do(), attempts=3)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        return strip_links_and_cleanup(raw)
+    except Exception as e:
+        logging.exception("ask_gpt failed")
+        u = USERS.get(user_id, {"lang": "ru"})
+        return _friendly_error_text(e, u.get("lang", "ru"))
 
 TIME_SENSITIVE_PATTERNS = [
     r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
@@ -463,7 +527,7 @@ def cache_set(q: str, a: str):
         LIVE_CACHE.pop(oldest, None)
     LIVE_CACHE[_norm_query(q)] = {"ts": time.time(), "answer": a}
 
-async def web_search_tavily(query: str, max_results: int = 3) -> dict | None:
+async def web_search_tavily(query: str, max_results: int = 3) -> Optional[dict]:
     if not TAVILY_API_KEY:
         return None
     depth = "advanced" if is_time_sensitive(query) else "basic"
@@ -475,46 +539,66 @@ async def web_search_tavily(query: str, max_results: int = 3) -> dict | None:
         "include_answer": True,
         "include_domains": [],
     }
-    r = await client_http.post("https://api.tavily.com/search", json=payload)
-    r.raise_for_status()
-    return r.json()
 
-async def answer_with_live_search(user_text: str, topic_hint: str | None, user_id: int) -> str:
+    async def _do():
+        return await client_http.post("https://api.tavily.com/search", json=payload)
+
+    try:
+        r = await _retry(lambda: _do(), attempts=2)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.warning("tavily search failed: %s", e)
+        return None
+
+async def answer_with_live_search(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
     c = cache_get(user_text)
     if c:
         return c
+
     data = await web_search_tavily(user_text)
     if not data:
         return await ask_gpt(user_text, topic_hint, user_id)
+
     snippets = []
     for it in (data.get("results") or [])[:3]:
         title = (it.get("title") or "")[:80]
         content = (it.get("content") or "")[:350]
         snippets.append(f"- {title}\n{content}")
+
     system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
     if topic_hint:
         system += f" Учитывай контекст темы: {topic_hint}"
     user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
+
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {"model": OPENAI_MODEL, "temperature": 0.3, "messages": build_messages(user_id, system, user_aug)}
-    r = await client_openai.post("/chat/completions", headers=headers, json=payload)
-    r.raise_for_status()
-    answer = r.json()["choices"][0]["message"]["content"].strip()
-    final = strip_links_and_cleanup(answer)
-    cache_set(user_text, final)
-    return final
+
+    async def _do():
+        return await client_openai.post("/chat/completions", headers=headers, json=payload)
+
+    try:
+        async with _model_sem:
+            r = await _retry(lambda: _do(), attempts=3)
+        r.raise_for_status()
+        answer = r.json()["choices"][0]["message"]["content"].strip()
+        final = strip_links_and_cleanup(answer)
+        cache_set(user_text, final)
+        return final
+    except Exception as e:
+        logging.exception("live answer failed")
+        u = USERS.get(user_id, {"lang": "ru"})
+        return _friendly_error_text(e, u.get("lang", "ru"))
 
 # ================== ВСПОМОГАТЕЛЬНОЕ: эффект «думаю…» =================
 async def send_thinking_progress(message: Message) -> Message:
     """Отправляет сообщение-прогресс и возвращает его для последующего редактирования."""
     try:
         m = await message.answer("⏳ Думаю…")
-        # небольшая плавная смена статуса
         await asyncio.sleep(0.6)
         await m.edit_text("🔎 Собираю информацию…")
         return m
     except Exception:
-        # если не получилось отредактировать — просто вернём исходное
         return await message.answer("🔎 Собираю информацию…")
 
 # ================== КОМАНДЫ =================
@@ -699,7 +783,8 @@ async def cb_topic(call: CallbackQuery):
         return await call.answer("OK")
     if key in TOPICS:
         u["topic"] = key; save_users()
-        lang = u["lang"]; title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
+        lang = u["lang"]; title = TOPICS[key]["title_уз"] if lang == "uz" else TOPICS[key]["title_ru"]  # typo guard
+        title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
         await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
 
@@ -787,12 +872,13 @@ async def handle_text(message: Message):
         append_history(uid, "user", text)
         append_history(uid, "assistant", reply)
 
-    except Exception:
-        logging.exception("OpenAI error")
+    except Exception as e:
+        logging.exception("handle_text fatal")
+        err_txt = _friendly_error_text(e, u.get("lang", "ru"))
         try:
-            await thinking_msg.edit_text("Извини, сервер перегружен. Попробуйте позже.")
+            await thinking_msg.edit_text(err_txt)
         except Exception:
-            await message.answer("Извини, сервер перегружен. Попробуйте позже.")
+            await message.answer(err_txt)
 
 # ================== Lifespan (инициализация/закрытие) =================
 @asynccontextmanager
