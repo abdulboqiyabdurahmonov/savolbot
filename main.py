@@ -654,7 +654,7 @@ async def cmd_start(message: Message):
     hello = WELCOME_UZ if u["lang"] == "uz" else WELCOME_RU
     await message.answer(hello)
 
-@dp.message(Command("help")))
+@dp.message(Command("help"))
 async def cmd_help(message: Message):
     u = get_user(message.from_user.id)
     txt = "ℹ️ Напишите вопрос (RU/UZ). Я умею генерировать картинки и помогать с документами.\n/tariffs — тариф, /myplan — план, /topics — тема." \
