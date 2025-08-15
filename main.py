@@ -477,43 +477,33 @@ import httpx
 # Семафор для ограничения одновременных запросов к модели
 _model_sem = asyncio.Semaphore(3)  # можешь поменять 3 на другое число, если хочешь больше параллельных запросов
 
-async def ask_gpt(prompt):
-    retries = 3
-    async with _model_sem:  # теперь внутри async def — ошибок не будет
-        for attempt in range(retries):
-            try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                        json={
-                            "model": "gpt-4o-mini",
-                            "messages": [{"role": "user", "content": prompt}]
-                        }
-                    )
-                    r.raise_for_status()
-                    return r.json()
-            except httpx.HTTPStatusError as e:
-                # Если превышен лимит запросов — ждём и пробуем снова
-                if e.response.status_code == 429 and attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # экспоненциальная пауза
-                    continue
-                else:
-                    raise
-            except httpx.RequestError as e:
-                # Ошибки сети (например, обрыв соединения)
-                if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                else:
-                    raise
+async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
+    """
+    Совместимо с остальным кодом:
+    - уважает семафор _model_sem (защита от 429)
+    - экспоненциальные ретраи через _retry
+    - единый AsyncClient client_openai
+    - язык ответа = язык вопроса (задано в BASE_SYSTEM_PROMPT)
+    - дружелюбные сообщения об ошибках
+    """
+    if not OPENAI_API_KEY:
+        return f"Вы спросили: {user_text}"
+
+    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.6,
+        "messages": build_messages(user_id, system, user_text),
+    }
 
     async def _do():
+        # каждый ретрай создаёт НОВЫЙ запрос
         return await client_openai.post("/chat/completions", headers=headers, json=payload)
 
     try:
         async with _model_sem:
-            r = await _retry(lambda: _do(), attempts=3)
+            r = await _retry(lambda: _do(), attempts=3)  # 429/5xx/таймауты
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
         return strip_links_and_cleanup(raw)
