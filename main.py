@@ -225,7 +225,7 @@ def save_history():
 def reset_history(user_id: int):
     HISTORY.pop(user_id, None); save_history()
 
-def append_history(user_id: int, role: str, content: str):
+def append_history(user_id: int, role: str, content: str, username: str | None = None, first_name: str | None = None):
     lst = HISTORY.setdefault(user_id, [])
     lst.append({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
     if len(lst) > 20:
@@ -234,7 +234,7 @@ def append_history(user_id: int, role: str, content: str):
     # Запись в Google Sheets — неблокирующая
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_sheets_append_history_async(user_id, role, content))
+        loop.create_task(_sheets_append_history_async(user_id, role, content, username, first_name))
     except RuntimeError:
         pass
 
@@ -354,8 +354,9 @@ def _history_ws():
         return sh.worksheet("History")
     except gspread.WorksheetNotFound:
         try:
-            ws = sh.add_worksheet(title="History", rows=50000, cols=4)
-            ws.append_row(["ts", "user_id", "role", "content"], value_input_option="RAW")
+            # ⬇️ Шапка History с нормальными колонками
+            ws = sh.add_worksheet(title="History", rows=50000, cols=6)
+            ws.append_row(["ts", "user_id", "username", "first_name", "role", "content"], value_input_option="RAW")
             return ws
         except Exception:
             logging.exception("Create History ws failed")
@@ -449,7 +450,7 @@ def _init_sheets():
         _sheets_client = _sheets_ws = None
 
 async def _sheets_append_async(row: dict):
-    """Неблокирующая запись строки аналитики в основной лист."""
+    """Неблокирующая запись строки аналитики в основной лист (по колонкам)."""
     if not _sheets_ws:
         return
     try:
@@ -466,7 +467,7 @@ async def _sheets_append_async(row: dict):
                     json.dumps(
                         {k: v for k, v in row.items()
                          if k not in {"ts", "user_id", "event", "topic", "live", "time_sensitive", "mode"}},
-                        ensure_ascii=False,
+                        ensure_ascii=False, separators=(",", ":")
                     ),
                 ],
                 value_input_option="RAW",
@@ -475,15 +476,17 @@ async def _sheets_append_async(row: dict):
     except Exception as e:
         logging.warning("Sheets append failed: %s", e)
 
-async def _sheets_append_history_async(user_id: int, role: str, content: str):
-    """Неблокирующая запись сообщения в лист History."""
+async def _sheets_append_history_async(
+    user_id: int, role: str, content: str, username: str | None = None, first_name: str | None = None
+):
+    """Неблокирующая запись сообщения в лист History (по колонкам)."""
     try:
         def _do():
             ws = _history_ws()
             if not ws:
                 return
             ws.append_row(
-                [datetime.utcnow().isoformat(), str(user_id), role, content],
+                [datetime.utcnow().isoformat(), str(user_id), username or "", first_name or "", role, content],
                 value_input_option="RAW"
             )
         await asyncio.to_thread(_do)
@@ -693,13 +696,37 @@ def tariffs_text(lang='ru'):
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
     u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"; save_users()
-    log_event(message.from_user.id, "start", lang=u["lang"])
-    await message.answer(
-        "👋 Привет! / Assalomu alaykum!\n"
-        f"Первые {FREE_LIMIT} ответов — бесплатно, дальше подписка «Старт».\n"
-        "Выберите тему: /topics\n"
-        "Актуальные данные (курс, новости, цены и т.п.) подхватываю автоматически."
+
+    # Логируем событие + историю со служебной метой
+    log_event(
+        message.from_user.id, "start",
+        lang=u["lang"],
+        username=message.from_user.username,
+        first_name=message.from_user.first_name
     )
+    append_history(
+        message.from_user.id, "user", "/start",
+        username=message.from_user.username, first_name=message.from_user.first_name
+    )
+
+    if u["lang"] == "uz":
+        greet = (
+            f"👋 Assalomu alaykum!\n"
+            f"Biz — SavolBot, TripleA kompaniyasining bir qismi. Avtoqo‘ng‘iroqlar, chat-botlar va GPT’ni Telegram’ga ulaymiz.\n"
+            f"Afzallik: Telegramda ChatGPT — oyiga **$5** (rasmiy $20 o‘rniga). Dastlabki {FREE_LIMIT} javob — bepul.\n\n"
+            f"/topics — mavzuni tanlang.\n"
+            f"Kurs, yangilik yoki narxlar kabi dolzarb ma’lumotlar kerak bo‘lsa — avtomatik qidiraman."
+        )
+    else:
+        greet = (
+            f"👋 Привет!\n"
+            f"Мы — SavolBot, часть компании **TripleA**. Делаем автообзвоны, чат-боты и подключаем **GPT прямо в Telegram**.\n"
+            f"Наше преимущество: доступ к ChatGPT в Telegram за **$5/мес** (вместо официальных $20/мес). "
+            f"Первые {FREE_LIMIT} ответов — бесплатно.\n\n"
+            f"/topics — выберите тему.\n"
+            f"Если нужны актуальные данные (курс, новости, цены) — я подхвачу автоматически."
+        )
+    await message.answer(greet)
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -713,7 +740,12 @@ async def cmd_help(message: Message):
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
     log_event(message.from_user.id, "about")
-    await message.answer("🤖 SavolBot от TripleA. В рамках закона РУз. Поддержать проект — /tariffs.")
+    txt = (
+        "🤖 SavolBot — часть TripleA. Мы делаем автообзвоны, чат-боты и подключаем GPT прямо в Telegram.\n"
+        "Почему с нами выгодно: ChatGPT в Telegram за **$5/мес** вместо официальных **$20/мес**.\n"
+        "Хотите для бизнеса? Поможем с голосовыми обзвонами, ботами и интеграциями. Подробнее — /tariffs."
+    )
+    await message.answer(txt)
 
 @dp.message(Command("tariffs"))
 async def cmd_tariffs(message: Message):
@@ -919,7 +951,7 @@ async def handle_text(message: Message):
     if any(re.search(rx, text.lower()) for rx in RECALL_PATTERNS):
         recap = short_recap(uid)
         await message.answer(recap)
-        append_history(uid, "user", text)
+        append_history(uid, "user", text, username=message.from_user.username, first_name=message.from_user.first_name)
         append_history(uid, "assistant", recap)
         return
     # ⬆️ Конец
@@ -933,12 +965,17 @@ async def handle_text(message: Message):
         reply = sanitize_answer(reply)
         await message.answer(reply)
 
-        append_history(uid, "user", text)
+        # История в столбцах (с метой пользователя)
+        append_history(uid, "user", text, username=message.from_user.username, first_name=message.from_user.first_name)
         append_history(uid, "assistant", reply)
 
+        # Аналитика с метаданными
+        preview = (text[:120] + "…") if len(text) > 120 else text
         log_event(uid, "question",
                   topic=u.get("topic"), live=use_live, time_sensitive=is_time_sensitive(text),
-                  whitelisted=is_whitelisted(uid))
+                  whitelisted=is_whitelisted(uid),
+                  username=message.from_user.username, first_name=message.from_user.first_name,
+                  text_preview=preview)
     except Exception:
         logging.exception("OpenAI error")
         return await message.answer("Извини, сервер перегружен. Попробуйте позже.")
