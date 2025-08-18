@@ -52,6 +52,7 @@ SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 USERS_SHEET = os.getenv("USERS_SHEET", "Users")        # лист-реестр пользователей
 HISTORY_SHEET = os.getenv("HISTORY_SHEET", "History")  # лог диалога
 METRICS_SHEET = os.getenv("METRICS_SHEET", "Metrics")  # события/метрики
+FEEDBACK_SHEET = os.getenv("FEEDBACK_SHEET", "Feedback")  # обратная связь
 
 # --- HTTPX clients & timeouts (reuse) ---
 HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=30.0)
@@ -284,7 +285,7 @@ def tariffs_text(lang='ru'):
             f"7 дней БЕСПЛАТНО → далее ${t['price_usd']}/мес"
         )
 
-# ================== SHEETS (Users + History + Metrics) =================
+# ================== SHEETS (Users + History + Metrics + Feedback) =================
 _sheets_client: Optional[gspread.Client] = None
 _users_ws: Optional[gspread.Worksheet] = None
 LAST_SHEETS_ERROR: Optional[str] = None
@@ -319,7 +320,7 @@ def _users_ws_get():
         logging.exception("_users_ws failed")
         return None
 
-# --- generic getter для History/Metrics ---
+# --- generic getter для листов с безопасным ensure header (без уменьшения строк) ---
 def _ws_get(tab_name: str, headers: list[str]):
     sh = _open_spreadsheet()
     if not sh:
@@ -329,7 +330,6 @@ def _ws_get(tab_name: str, headers: list[str]):
     except gspread.WorksheetNotFound:
         try:
             ws = sh.add_worksheet(title=tab_name, rows=200000, cols=max(len(headers), 6))
-            # ставим шапку сразу
             end_a1 = rowcol_to_a1(1, len(headers))
             ws.update(f"A1:{end_a1}", [headers], value_input_option="RAW")
             return ws
@@ -340,27 +340,23 @@ def _ws_get(tab_name: str, headers: list[str]):
         logging.exception("_ws_get(%s) failed", tab_name)
         return None
 
-    # --- ensure header (больше НЕ трогаем количество строк) ---
     try:
-        # если колонок меньше, только увеличиваем их число
         need_cols = max(len(headers), 6)
         if getattr(ws, "col_count", 0) < need_cols:
-            ws.resize(cols=need_cols)  # rows не указываем, чтобы не уменьшать
-
-        # перезаписываем первую строку ровно по длине headers
+            ws.resize(cols=need_cols)  # не трогаем rows
         end_a1 = rowcol_to_a1(1, len(headers))
         ws.update(f"A1:{end_a1}", [headers], value_input_option="RAW")
     except Exception:
         logging.exception("ensure header for %s failed", tab_name)
 
     return ws
-    
+
 def _init_sheets():
     """
     Минимальная инициализация Sheets:
     - поддержка raw JSON и base64
     - нормализация private_key с \\n -> \n
-    - Users/History/Metrics — создание и заголовки при отсутствии
+    - Users/History/Metrics/Feedback — создание и заголовки при отсутствии
     """
     global _sheets_client, _users_ws, LAST_SHEETS_ERROR
     if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and USERS_SHEET):
@@ -400,9 +396,10 @@ def _init_sheets():
             logging.warning("Worksheet '%s' not found, creating…", USERS_SHEET)
             _users_ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=8)
             _users_ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until"], value_input_option="RAW")
-        # Ensure History/Metrics exist with correct headers
+        # Ensure другие листы
         _ = _ws_get(HISTORY_SHEET, ["ts","user_id","role","content","col1","col2"])
         _ = _ws_get(METRICS_SHEET, ["ts","user_id","event","value","notes"])
+        _ = _ws_get(FEEDBACK_SHEET, ["ts","user_id","username","first_name","last_name","feedback","comment"])
 
         LAST_SHEETS_ERROR = None
         logging.info("Sheets OK: spreadsheet=%s users_sheet=%s", SHEETS_SPREADSHEET_ID, USERS_SHEET)
@@ -411,12 +408,6 @@ def _init_sheets():
         LAST_SHEETS_ERROR = f"{type(e).__name__}: {e}"
         logging.exception("Sheets init failed")
         _sheets_client = _users_ws = None
-
-# Ensure History/Metrics exist with correct headers
-_ = _ws_get(HISTORY_SHEET, ["ts","user_id","role","content","col1","col2"])
-_ = _ws_get(METRICS_SHEET, ["ts","user_id","event","value","notes"])
-# NEW: Feedback
-_ = _ws_get(FEEDBACK_SHEET, ["ts","user_id","username","first_name","last_name","feedback","comment"])
 
 async def _sheets_register_user_async(user_id: int):
     """Разовая запись пользователя в лист Users (если ещё не записан)."""
@@ -459,7 +450,7 @@ async def _sheets_update_user_row_async(user_id: int, username: str, first_name:
     except Exception:
         logging.exception("sheets_update_user_row failed")
 
-# --- append в History/Metrics ---
+# --- append в History/Metrics/Feedback ---
 async def _sheets_append_history_async(user_id: int, role: str, content: str, col1: str = "", col2: str = ""):
     if not _sheets_client:
         return
@@ -569,19 +560,10 @@ import asyncio as _asyncio_shadow  # не используется, оставл
 import httpx as _httpx_shadow     # не используется, оставлено для совместимости
 
 # Семафор для ограничения одновременных запросов к модели
-# Используем значение из MODEL_CONCURRENCY (если вдруг ниже будет ещё одно объявление — не переопределяем)
 if not isinstance(_model_sem, asyncio.Semaphore):
     _model_sem = asyncio.Semaphore(MODEL_CONCURRENCY)
 
 async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
-    """
-    Совместимо с остальным кодом:
-    - уважает семафор _model_sem (защита от 429)
-    - экспоненциальные ретраи через _retry
-    - единый AsyncClient client_openai
-    - язык ответа = язык вопроса (задано в BASE_SYSTEM_PROMPT)
-    - дружелюбные сообщения об ошибках
-    """
     if not OPENAI_API_KEY:
         return f"Вы спросили: {user_text}"
 
@@ -711,6 +693,20 @@ async def send_thinking_progress(message: Message) -> Message:
     except Exception:
         return await message.answer("🔎 Собираю информацию…")
 
+# ================== FEEDBACK UI =================
+def feedback_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👍 Ок", callback_data="fb:ok"),
+            InlineKeyboardButton(text="👎 Не ок", callback_data="fb:bad"),
+        ],
+        [InlineKeyboardButton(text="✍️ Оставить комментарий", callback_data="fb:comment")],
+        [InlineKeyboardButton(text="↩️ Закрыть", callback_data="fb:close")],
+    ])
+
+# флаг ожидания комментария: {user_id}
+FEEDBACK_PENDING: set[int] = set()
+
 # ================== КОМАНДЫ =================
 WELCOME_RU = (
     "👋 Привет! Я — SavolBot, часть команды TripleA.\n"
@@ -736,7 +732,7 @@ TOPICS = {
     "finance": {"title_ru": "Финансы", "title_uz": "Moliya", "hint": "Объясняй с цифрами и примерами. Без рискованных персональных рекомендаций."},
     "gov":     {"title_ru": "Госуслуги", "title_uz": "Davlat xizmatlari", "hint": "Опиши процедуру, документы и шаги подачи."},
     "biz":     {"title_ru": "Бизнес", "title_uz": "Biznes", "hint": "Краткие инструкции по регистрации/отчётности/документам."},
-    "edu":     {"title_ru": "Учёба", "title_uz": "Ta’lim", "hint": "Расскажи про поступление/обучение и шаги."},
+    "edu":     {"title_ru": "Учёба", "title_уз": "Ta’lim", "hint": "Расскажи про поступление/обучение и шаги."},
     "it":      {"title_ru": "IT", "title_uz": "IT", "hint": "Технически и конкретно. Не советуй ничего незаконного."},
     "health":  {"title_ru": "Здоровье (общ.)", "title_uz": "Sog‘liq (umumiy)", "hint": "Только общая информация. Советуй обращаться к врачу."},
 }
@@ -755,11 +751,9 @@ def topic_kb(lang="ru", current=None):
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
     u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"; save_users()
-    # Реестр в Sheets — в фоне
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_sheets_register_user_async(message.from_user.id))
-        # Логируем событие в Metrics и History
         loop.create_task(_sheets_append_metric_async(message.from_user.id, "cmd", "start"))
         loop.create_task(_sheets_append_history_async(message.from_user.id, "user", "/start"))
     except RuntimeError:
@@ -825,6 +819,17 @@ async def cmd_new(message: Message):
     reset_history(message.from_user.id)
     txt = "🧹 Контекст очищен. Начинаем новую тему." if get_user(message.from_user.id)["lang"] == "ru" else "🧹 Kontekst tozalandi. Yangi mavzu."
     await message.answer(txt)
+
+# -------- Feedback командой ----------
+@dp.message(Command("feedback"))
+async def cmd_feedback(message: Message):
+    u = get_user(message.from_user.id)
+    txt = "Вам удобно пользоваться нашим ботом?" if u["lang"] == "ru" else "Bizning botdan foydalanish qulaymi?"
+    await message.answer(txt, reply_markup=feedback_kb())
+    try:
+        asyncio.get_running_loop().create_task(_sheets_append_metric_async(message.from_user.id, "feedback_prompt", "manual"))
+    except RuntimeError:
+        pass
 
 # -------- Sheets диагностика ----------
 @dp.message(Command("gs_debug"))
@@ -908,6 +913,65 @@ async def cb_topic(call: CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
         await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
 
+# ================== CALLBACKS (feedback) =================
+@dp.callback_query(F.data == "fb:close")
+async def cb_fb_close(call: CallbackQuery):
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.answer("Спасибо!")
+
+@dp.callback_query(F.data == "fb:ok")
+async def cb_fb_ok(call: CallbackQuery):
+    uid = call.from_user.id
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_append_feedback_async(
+            uid,
+            call.from_user.username or "",
+            call.from_user.first_name or "",
+            call.from_user.last_name or "",
+            "ok",
+            ""
+        ))
+        loop.create_task(_sheets_append_metric_async(uid, "feedback", "ok"))
+    except RuntimeError:
+        pass
+    await call.message.edit_text("Принято: 👍 Ок. Спасибо за отзыв!" if get_user(uid)["lang"]=="ru" else "Qabul qilindi: 👍 Ok. Rahmat!")
+    await call.answer()
+
+@dp.callback_query(F.data == "fb:bad")
+async def cb_fb_bad(call: CallbackQuery):
+    uid = call.from_user.id
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_append_feedback_async(
+            uid,
+            call.from_user.username or "",
+            call.from_user.first_name or "",
+            call.from_user.last_name or "",
+            "not_ok",
+            ""
+        ))
+        loop.create_task(_sheets_append_metric_async(uid, "feedback", "not_ok"))
+    except RuntimeError:
+        pass
+    await call.message.edit_text("Зафиксировал: 👎 Не ок. Спасибо!" if get_user(uid)["lang"]=="ru" else "Yozib oldim: 👎 Not ok. Rahmat!")
+    await call.answer()
+
+@dp.callback_query(F.data == "fb:comment")
+async def cb_fb_comment(call: CallbackQuery):
+    uid = call.from_user.id
+    FEEDBACK_PENDING.add(uid)
+    txt = (
+        "Напишите короткий комментарий одним сообщением (или /cancel):"
+        if get_user(uid)["lang"] == "ru"
+        else "Bitta xabar bilan qisqa izoh yozing (yoki /cancel):"
+    )
+    await call.message.edit_text(txt)
+    await call.answer()
+
 # ================== АДМИН: активация подписки =================
 @dp.message(Command("grant_creative"))
 async def cmd_grant_creative(message: Message):
@@ -944,6 +1008,34 @@ async def handle_text(message: Message):
     # Язык
     if is_uzbek(text):
         u["lang"] = "uz"; save_users()
+
+    # --- перехват комментария по фидбэку ---
+    if uid in FEEDBACK_PENDING:
+        FEEDBACK_PENDING.discard(uid)
+        comment_text = text
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_feedback_async(
+                uid,
+                message.from_user.username or "",
+                message.from_user.first_name or "",
+                message.from_user.last_name or "",
+                "comment_only",
+                comment_text
+            ))
+            loop.create_task(_sheets_append_metric_async(uid, "feedback", "comment"))
+        except RuntimeError:
+            pass
+        ok_txt = "Спасибо! Ваш отзыв записан 🙌" if u["lang"]=="ru" else "Rahmat! Fikringiz yozib olindi 🙌"
+        await message.answer(ok_txt)
+        append_history(uid, "user", comment_text)
+        append_history(uid, "assistant", ok_txt)
+        try:
+            loop.create_task(_sheets_append_history_async(uid, "user", comment_text))
+            loop.create_task(_sheets_append_history_async(uid, "assistant", ok_txt))
+        except RuntimeError:
+            pass
+        return
 
     # Политика
     low = text.lower()
