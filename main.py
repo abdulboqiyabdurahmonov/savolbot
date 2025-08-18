@@ -412,6 +412,12 @@ def _init_sheets():
         logging.exception("Sheets init failed")
         _sheets_client = _users_ws = None
 
+# Ensure History/Metrics exist with correct headers
+_ = _ws_get(HISTORY_SHEET, ["ts","user_id","role","content","col1","col2"])
+_ = _ws_get(METRICS_SHEET, ["ts","user_id","event","value","notes"])
+# NEW: Feedback
+_ = _ws_get(FEEDBACK_SHEET, ["ts","user_id","username","first_name","last_name","feedback","comment"])
+
 async def _sheets_register_user_async(user_id: int):
     """Разовая запись пользователя в лист Users (если ещё не записан)."""
     u = USERS.get(user_id)
