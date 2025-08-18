@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
+from gspread.utils import rowcol_to_a1
 
 import httpx
 from httpx import HTTPError, HTTPStatusError
@@ -328,7 +329,9 @@ def _ws_get(tab_name: str, headers: list[str]):
     except gspread.WorksheetNotFound:
         try:
             ws = sh.add_worksheet(title=tab_name, rows=200000, cols=max(len(headers), 6))
-            ws.append_row(headers, value_input_option="RAW")
+            # ставим шапку сразу
+            end_a1 = rowcol_to_a1(1, len(headers))
+            ws.update(f"A1:{end_a1}", [headers], value_input_option="RAW")
             return ws
         except Exception:
             logging.exception("Create ws '%s' failed", tab_name)
@@ -336,16 +339,22 @@ def _ws_get(tab_name: str, headers: list[str]):
     except Exception:
         logging.exception("_ws_get(%s) failed", tab_name)
         return None
-    # ensure header
+
+    # --- ensure header (больше НЕ трогаем количество строк) ---
     try:
-        cur = ws.row_values(1)
-        if cur != headers:
-            ws.resize(rows=1, cols=max(len(headers), len(cur), 6))
-            ws.update("A1", [headers])
+        # если колонок меньше, только увеличиваем их число
+        need_cols = max(len(headers), 6)
+        if getattr(ws, "col_count", 0) < need_cols:
+            ws.resize(cols=need_cols)  # rows не указываем, чтобы не уменьшать
+
+        # перезаписываем первую строку ровно по длине headers
+        end_a1 = rowcol_to_a1(1, len(headers))
+        ws.update(f"A1:{end_a1}", [headers], value_input_option="RAW")
     except Exception:
         logging.exception("ensure header for %s failed", tab_name)
-    return ws
 
+    return ws
+    
 def _init_sheets():
     """
     Минимальная инициализация Sheets:
