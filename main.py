@@ -473,6 +473,29 @@ async def _sheets_append_history_async(user_id: int, role: str, content: str, co
     except Exception:
         logging.exception("sheets_append_history failed")
 
+async def _sheets_append_feedback_async(
+    user_id: int, username: str, first_name: str, last_name: str, feedback: str, comment: str = ""
+):
+    if not _sheets_client:
+        return
+    try:
+        def _do():
+            ws = _ws_get(FEEDBACK_SHEET, ["ts","user_id","username","first_name","last_name","feedback","comment"])
+            if not ws:
+                return
+            ws.append_row([
+                _ts(),
+                str(user_id),
+                username or "",
+                first_name or "",
+                last_name or "",
+                feedback,
+                comment or ""
+            ], value_input_option="RAW")
+        await asyncio.to_thread(_do)
+    except Exception:
+        logging.exception("sheets_append_feedback failed")
+
 async def _sheets_append_metric_async(user_id: int, event: str, value: str = "", notes: str = ""):
     if not _sheets_client:
         return
