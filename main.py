@@ -46,10 +46,13 @@ HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "chat_history.json")
 # --- Google Sheets ENV ---
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON одной строкой (или base64)
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
-USERS_SHEET = os.getenv("USERS_SHEET", "Users")  # лист-реестр пользователей
+
+# Названия листов (можно переопределить через ENV)
+USERS_SHEET = os.getenv("USERS_SHEET", "Users")        # лист-реестр пользователей
+HISTORY_SHEET = os.getenv("HISTORY_SHEET", "History")  # лог диалога
+METRICS_SHEET = os.getenv("METRICS_SHEET", "Metrics")  # события/метрики
 
 # --- HTTPX clients & timeouts (reuse) ---
-# Усиленные таймауты для устойчивости
 HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=30.0)
 client_openai: Optional[httpx.AsyncClient] = None
 client_http: Optional[httpx.AsyncClient] = None
@@ -122,10 +125,8 @@ def load_users():
         USERS = {}
 
 def has_active_sub(u: dict) -> bool:
-    # creative — платная подписка
     if u.get("plan") == "creative" and u.get("paid_until") and u["paid_until"] > datetime.utcnow():
         return True
-    # trial — 7 дней
     if u.get("plan", "trial") == "trial" and u.get("paid_until") and u["paid_until"] > datetime.utcnow():
         return True
     return False
@@ -141,7 +142,6 @@ def get_user(tg_id: int):
             "registered_to_sheets": False,
         }
         save_users()
-        # без лишней аналитики — только реестр в Sheets (асинхронно)
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(_sheets_register_user_async(tg_id))
@@ -155,7 +155,7 @@ def pay_kb():
         [InlineKeyboardButton(text="ℹ️ О тарифе", callback_data="show_tariffs")]
     ])
 
-# ================== ИСТОРИЯ ДИАЛОГА =================
+# ================== ИСТОРИЯ ДИАЛОГА (локальная) =================
 HISTORY: dict[int, list[dict]] = {}  # {user_id: [ {role:"user"/"assistant", content:str, ts:str}, ... ]}
 
 def _hist_path() -> Path:
@@ -283,7 +283,7 @@ def tariffs_text(lang='ru'):
             f"7 дней БЕСПЛАТНО → далее ${t['price_usd']}/мес"
         )
 
-# ================== SHEETS (ТОЛЬКО РЕЕСТР ПОЛЬЗОВАТЕЛЕЙ) =================
+# ================== SHEETS (Users + History + Metrics) =================
 _sheets_client: Optional[gspread.Client] = None
 _users_ws: Optional[gspread.Worksheet] = None
 LAST_SHEETS_ERROR: Optional[str] = None
@@ -318,12 +318,40 @@ def _users_ws_get():
         logging.exception("_users_ws failed")
         return None
 
+# --- generic getter для History/Metrics ---
+def _ws_get(tab_name: str, headers: list[str]):
+    sh = _open_spreadsheet()
+    if not sh:
+        return None
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        try:
+            ws = sh.add_worksheet(title=tab_name, rows=200000, cols=max(len(headers), 6))
+            ws.append_row(headers, value_input_option="RAW")
+            return ws
+        except Exception:
+            logging.exception("Create ws '%s' failed", tab_name)
+            return None
+    except Exception:
+        logging.exception("_ws_get(%s) failed", tab_name)
+        return None
+    # ensure header
+    try:
+        cur = ws.row_values(1)
+        if cur != headers:
+            ws.resize(rows=1, cols=max(len(headers), len(cur), 6))
+            ws.update("A1", [headers])
+    except Exception:
+        logging.exception("ensure header for %s failed", tab_name)
+    return ws
+
 def _init_sheets():
     """
     Минимальная инициализация Sheets:
     - поддержка raw JSON и base64
     - нормализация private_key с \\n -> \n
-    - создаём лист Users и заголовки при отсутствии
+    - Users/History/Metrics — создание и заголовки при отсутствии
     """
     global _sheets_client, _users_ws, LAST_SHEETS_ERROR
     if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and USERS_SHEET):
@@ -356,12 +384,16 @@ def _init_sheets():
         _sheets_client = gspread.authorize(creds)
 
         sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
+        # Users
         try:
             _users_ws = sh.worksheet(USERS_SHEET)
         except gspread.WorksheetNotFound:
             logging.warning("Worksheet '%s' not found, creating…", USERS_SHEET)
             _users_ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=8)
             _users_ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until"], value_input_option="RAW")
+        # Ensure History/Metrics exist with correct headers
+        _ = _ws_get(HISTORY_SHEET, ["ts","user_id","role","content","col1","col2"])
+        _ = _ws_get(METRICS_SHEET, ["ts","user_id","event","value","notes"])
 
         LAST_SHEETS_ERROR = None
         logging.info("Sheets OK: spreadsheet=%s users_sheet=%s", SHEETS_SPREADSHEET_ID, USERS_SHEET)
@@ -412,12 +444,35 @@ async def _sheets_update_user_row_async(user_id: int, username: str, first_name:
     except Exception:
         logging.exception("sheets_update_user_row failed")
 
+# --- append в History/Metrics ---
+async def _sheets_append_history_async(user_id: int, role: str, content: str, col1: str = "", col2: str = ""):
+    if not _sheets_client:
+        return
+    try:
+        def _do():
+            ws = _ws_get(HISTORY_SHEET, ["ts","user_id","role","content","col1","col2"])
+            if not ws:
+                return
+            ws.append_row([_ts(), str(user_id), role, content, col1, col2], value_input_option="RAW")
+        await asyncio.to_thread(_do)
+    except Exception:
+        logging.exception("sheets_append_history failed")
+
+async def _sheets_append_metric_async(user_id: int, event: str, value: str = "", notes: str = ""):
+    if not _sheets_client:
+        return
+    try:
+        def _do():
+            ws = _ws_get(METRICS_SHEET, ["ts","user_id","event","value","notes"])
+            if not ws:
+                return
+            ws.append_row([_ts(), str(user_id), event, value, notes], value_input_option="RAW")
+        await asyncio.to_thread(_do)
+    except Exception:
+        logging.exception("sheets_append_metric failed")
+
 # ================== БЕЗОТКАЗНОСТЬ: retry + дружелюбные ошибки =================
 async def _retry(coro_factory, attempts=3, base_delay=0.8):
-    """
-    coro_factory: функция без аргументов, возвращающая coroutine (новый запрос на каждый заход).
-    Повторяем на 429/5xx/таймаутах с экспоненциальной паузой и джиттером.
-    """
     last_exc = None
     for i in range(attempts):
         try:
@@ -471,11 +526,14 @@ BASE_SYSTEM_PROMPT = (
     "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами."
 )
 
-import asyncio
-import httpx
+# (повторный импорт asyncio/httpx в исходнике был — не трогаю)
+import asyncio as _asyncio_shadow  # не используется, оставлено для совместимости
+import httpx as _httpx_shadow     # не используется, оставлено для совместимости
 
 # Семафор для ограничения одновременных запросов к модели
-_model_sem = asyncio.Semaphore(3)  # можешь поменять 3 на другое число, если хочешь больше параллельных запросов
+# Используем значение из MODEL_CONCURRENCY (если вдруг ниже будет ещё одно объявление — не переопределяем)
+if not isinstance(_model_sem, asyncio.Semaphore):
+    _model_sem = asyncio.Semaphore(MODEL_CONCURRENCY)
 
 async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
     """
@@ -498,12 +556,11 @@ async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> st
     }
 
     async def _do():
-        # каждый ретрай создаёт НОВЫЙ запрос
         return await client_openai.post("/chat/completions", headers=headers, json=payload)
 
     try:
         async with _model_sem:
-            r = await _retry(lambda: _do(), attempts=3)  # 429/5xx/таймауты
+            r = await _retry(lambda: _do(), attempts=3)
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
         return strip_links_and_cleanup(raw)
@@ -608,7 +665,6 @@ async def answer_with_live_search(user_text: str, topic_hint: Optional[str], use
 
 # ================== ВСПОМОГАТЕЛЬНОЕ: эффект «думаю…» =================
 async def send_thinking_progress(message: Message) -> Message:
-    """Отправляет сообщение-прогресс и возвращает его для последующего редактирования."""
     try:
         m = await message.answer("⏳ Думаю…")
         await asyncio.sleep(0.4)
@@ -633,7 +689,7 @@ WELCOME_UZ = (
     "Afzalligimiz: ChatGPT’ga Telegramning o‘zida qulay kirish — oyiga atigi $10 (rasmiy $20 o‘rniga).\n\n"
     "Tarif: ⭐ Creative — suratlar generatsiyasi, hujjatlar bo‘yicha yordam, cheklanmagan xabarlar. "
     "Hozir 7 kunlik bepul davr. Keyin — $10/oy.\n\n"
-    "Foydali: /tariffs — tarif, /myplan — rejam, /topics — mavzu tanlash.\n"
+    "Foydali: /tariffs — tarif, /myplan — reja, /topics — mavzu tanlash.\n"
     "Savolingizni yozing — boshlaymiz!"
 )
 
@@ -661,14 +717,21 @@ def topic_kb(lang="ru", current=None):
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
     u["lang"] = "uz" if is_uzbek(message.text or "") else "ru"; save_users()
-    # Реестр в Sheets (если инициализированы env) — в фоне
+    # Реестр в Sheets — в фоне
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_sheets_register_user_async(message.from_user.id))
+        # Логируем событие в Metrics и History
+        loop.create_task(_sheets_append_metric_async(message.from_user.id, "cmd", "start"))
+        loop.create_task(_sheets_append_history_async(message.from_user.id, "user", "/start"))
     except RuntimeError:
         pass
     hello = WELCOME_UZ if u["lang"] == "uz" else WELCOME_RU
     await message.answer(hello)
+    try:
+        asyncio.get_running_loop().create_task(_sheets_append_history_async(message.from_user.id, "assistant", hello))
+    except RuntimeError:
+        pass
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -677,6 +740,10 @@ async def cmd_help(message: Message):
         if u["lang"] == "ru" else \
         "ℹ️ Savolingizni yozing (RU/UZ). Surat generatsiyasi va hujjatlar bo‘yicha yordam.\n/tariffs — tarif, /myplan — reja, /topics — mavzu."
     await message.answer(txt)
+    try:
+        asyncio.get_running_loop().create_task(_sheets_append_history_async(message.from_user.id, "assistant", txt))
+    except RuntimeError:
+        pass
 
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
@@ -718,7 +785,8 @@ async def cmd_topics(message: Message):
 @dp.message(Command("new"))
 async def cmd_new(message: Message):
     reset_history(message.from_user.id)
-    await message.answer("🧹 Контекст очищен. Начинаем новую тему." if get_user(message.from_user.id)["lang"] == "ru" else "🧹 Kontekst tozalandi. Yangi mavzu.")
+    txt = "🧹 Контекст очищен. Начинаем новую тему." if get_user(message.from_user.id)["lang"] == "ru" else "🧹 Kontekst tozalandi. Yangi mavzu."
+    await message.answer(txt)
 
 # -------- Sheets диагностика ----------
 @dp.message(Command("gs_debug"))
@@ -761,7 +829,6 @@ async def cb_show_tariffs(call: CallbackQuery):
 
 @dp.callback_query(F.data == "subscribe_creative")
 async def cb_subscribe_creative(call: CallbackQuery):
-    # Заглушка — заменишь ссылку на реальную
     pay_link = "https://pay.example.com/savolbot/creative"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Я оплатил", callback_data="paid_creative_done")]
@@ -818,12 +885,12 @@ async def cmd_grant_creative(message: Message):
     try:
         if bot:
             await bot.send_message(target_id, "✅ Подписка «Creative» активирована. Приятного использования!")
-        # Запишем обновление статуса в Users лист
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(_sheets_update_user_row_async(
                 target_id, "", "", "", get_user(target_id).get("lang","ru"), "creative", u["paid_until"]
             ))
+            loop.create_task(_sheets_append_metric_async(target_id, "grant", "creative"))
         except RuntimeError:
             pass
     except Exception:
@@ -843,16 +910,31 @@ async def handle_text(message: Message):
     # Политика
     low = text.lower()
     if any(re.search(rx, low) for rx in ILLEGAL_PATTERNS):
-        return await message.answer(DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU)
+        deny = DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU
+        await message.answer(deny)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_history_async(uid, "user", text))
+            loop.create_task(_sheets_append_history_async(uid, "assistant", deny))
+            loop.create_task(_sheets_append_metric_async(uid, "deny", "policy"))
+        except RuntimeError:
+            pass
+        return
 
     # Проверка подписки / триала (если не в белом списке)
     if (not is_whitelisted(uid)) and (not has_active_sub(u)):
-        return await message.answer(
-            "💳 Бесплатный период закончился. Подключите ⭐ Creative, чтобы продолжить:",
-            reply_markup=pay_kb()
-        )
+        txt = "💳 Бесплатный период закончился. Подключите ⭐ Creative, чтобы продолжить:"
+        await message.answer(txt, reply_markup=pay_kb())
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_history_async(uid, "user", text))
+            loop.create_task(_sheets_append_history_async(uid, "assistant", txt))
+            loop.create_task(_sheets_append_metric_async(uid, "paywall", "shown"))
+        except RuntimeError:
+            pass
+        return
 
-    # Сохраним идентификацию в Users-реестр (username/имя), чтобы саппорт вас находил
+    # Сохраним идентификацию в Users-реестр (username/имя)
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_sheets_update_user_row_async(
@@ -864,6 +946,8 @@ async def handle_text(message: Message):
             u.get("plan", "trial"),
             u.get("paid_until"),
         ))
+        loop.create_task(_sheets_append_history_async(uid, "user", text))
+        loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(text)), notes="user_len"))
     except RuntimeError:
         pass
 
@@ -871,17 +955,14 @@ async def handle_text(message: Message):
     thinking_msg = await send_thinking_progress(message)
 
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    use_live = is_time_sensitive(text)  # включаем интернет-поиск только для «актуальных» вопросов
+    use_live = is_time_sensitive(text)
 
     async def _get_answer():
         return await (answer_with_live_search(text, topic_hint, uid) if use_live else ask_gpt(text, topic_hint, uid))
 
     try:
-        # Общий таймаут на получение ответа, чтобы «не зависал и не думал долго»
         reply = await asyncio.wait_for(_get_answer(), timeout=REPLY_TIMEOUT_SEC)
         reply = strip_links_and_cleanup(reply)
-
-        # Редактируем плейсхолдер на итоговый ответ
         try:
             await thinking_msg.edit_text(reply)
         except Exception:
@@ -890,12 +971,23 @@ async def handle_text(message: Message):
         append_history(uid, "user", text)
         append_history(uid, "assistant", reply)
 
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
+            loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(reply)), notes="assistant_len"))
+        except RuntimeError:
+            pass
+
     except asyncio.TimeoutError:
         err_txt = _friendly_error_text(asyncio.TimeoutError(), u.get("lang","ru"))
         try:
             await thinking_msg.edit_text(err_txt)
         except Exception:
             await message.answer(err_txt)
+        try:
+            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "timeout"))
+        except RuntimeError:
+            pass
     except Exception as e:
         logging.exception("handle_text fatal")
         err_txt = _friendly_error_text(e, u.get("lang", "ru"))
@@ -903,6 +995,10 @@ async def handle_text(message: Message):
             await thinking_msg.edit_text(err_txt)
         except Exception:
             await message.answer(err_txt)
+        try:
+            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "generic", notes=str(e)))
+        except RuntimeError:
+            pass
 
 # ================== Lifespan (инициализация/закрытие) =================
 @asynccontextmanager
