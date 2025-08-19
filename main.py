@@ -40,6 +40,10 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # Принудительно использовать live-поиск для всех вопросов (если 1)
 FORCE_LIVE = os.getenv("FORCE_LIVE", "0") == "1"
 
+# Верификация динамичных ответов (цифры/годы/ставки)
+VERIFY_DYNAMIC = os.getenv("VERIFY_DYNAMIC", "1") == "1"
+VERIFY_TIMEOUT_SEC = int(os.getenv("VERIFY_TIMEOUT_SEC", "10"))
+
 # Админ
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
 
@@ -629,6 +633,72 @@ def _sanitize_cutoff(text: str) -> str:
     return s
 
 
+
+# === Эвристики «динамичности» и верификация ответа ===
+_DYNAMIC_KEYWORDS = [
+    "курс", "ставк", "инфляц", "зарплат", "налог", "цена", "тариф", "пособи", "пенси", "кредит",
+    "новост", "прогноз", "изменени", "обновлени", "statistika", "narx", "stavka", "yangilik", "price", "rate",
+]
+import re as _re2
+def _contains_fresh_year(s: str, window: int = 3) -> bool:
+    try:
+        y_now = datetime.utcnow().year
+    except Exception:
+        y_now = 2025
+    years = [int(y) for y in _re2.findall(r"\\b(20\\d{2})\\b", s or "")]
+    return any(y_now - y <= window for y in years)
+
+def _looks_dynamic(*texts: str) -> bool:
+    low = " ".join([t.lower() for t in texts if t])
+    return any(k in low for k in _DYNAMIC_KEYWORDS) or _contains_fresh_year(low)
+
+async def verify_with_live_sources(user_text: str, draft_answer: str, topic_hint: Optional[str], user_id: int) -> str:
+    \"\"\"Перепроверяет черновик по live-источникам и при необходимости корректирует цифры/даты.\"\"\"
+    if not TAVILY_API_KEY:
+        return draft_answer
+
+    data = await web_search_tavily(user_text, max_results=5)
+    if not data:
+        return draft_answer
+
+    snippets = []
+    for it in (data.get("results") or [])[:5]:
+        title = (it.get("title") or "")[:100]
+        content = (it.get("content") or "")[:400]
+        snippets.append(f"- {title}\\n{content}")
+
+    system = (
+        BASE_SYSTEM_PROMPT
+        + " Проверь факты и при необходимости скорректируй числа/даты/ставки на основе источников. "
+          "Если исправляешь — чётко перепиши фрагменты, не ссылайся на URL, не упоминай 'источники ниже'. "
+          "Пиши компактно, без дисклеймеров об отсечке знаний."
+    )
+    if topic_hint:
+        system += f" Учитывай контекст темы: {topic_hint}"
+
+    user_aug = (\
+        "ВОПРОС:\\n" + (user_text or "") + "\\n\\n"
+        "ЧЕРНОВИК ОТВЕТА:\\n" + (draft_answer or "") + "\\n\\n"
+        "СВОДКА ИСТОЧНИКОВ (без ссылок):\\n" + "\\n\\n".join(snippets)
+    )
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {"model": OPENAI_MODEL, "temperature": 0.2, "messages": build_messages(user_id, system, user_aug)}
+
+    async def _do():
+        return await client_openai.post("/chat/completions", headers=headers, json=payload)
+
+    try:
+        async with _model_sem:
+            r = await _retry(lambda: _do(), attempts=2)
+        r.raise_for_status()
+        corrected = r.json()["choices"][0]["message"]["content"].strip()
+        corrected = strip_links_and_cleanup(_sanitize_cutoff(corrected))
+        # Если модель вернула пусто — оставим черновик
+        return corrected if corrected else draft_answer
+    except Exception:
+        return draft_answer
+
 # === LIVE CACHE (было) ===
 CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
 CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
@@ -1110,16 +1180,25 @@ async def _process_task(task: SavolTask):
         reply = await asyncio.wait_for(_get_answer(), timeout=REPLY_TIMEOUT_SEC)
         reply = strip_links_and_cleanup(reply)
 
-        # 3) Отправка пользователю
+        # 3) Верификация по live-источникам (при необходимости)
+        if VERIFY_DYNAMIC and _looks_dynamic(text, reply):
+            try:
+                reply_v = await asyncio.wait_for(verify_with_live_sources(text, reply, topic_hint, uid), timeout=VERIFY_TIMEOUT_SEC)
+                if reply_v and reply_v.strip():
+                    reply = reply_v
+            except Exception:
+                pass
+
+        # 4) Отправка пользователю
         try:
             await bot.send_message(chat_id, reply)
         except Exception:
             pass
 
-        # 4) Кэширование
+        # 5) Кэширование
         qa_cache_set(text, reply)
 
-        # 5) История и метрики
+        # 6) История и метрики
         append_history(uid, "user", text)      # как было раньше (после ответа)
         append_history(uid, "assistant", reply)
         try:
