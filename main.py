@@ -37,6 +37,9 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # Live-поиск (через Tavily) — опционально
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
+# Принудительно использовать live-поиск для всех вопросов (если 1)
+FORCE_LIVE = os.getenv("FORCE_LIVE", "0") == "1"
+
 # Админ
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
 
@@ -552,7 +555,7 @@ BASE_SYSTEM_PROMPT = (
     "Не давай инструкций для незаконных действий. По медицине — только общая справка и совет обратиться к врачу. "
     "Язык ответа = язык вопроса (RU/UZ). Никогда не вставляй ссылки и URL. "
     "Если контекста мало — вежливо попроси напомнить ключевые детали и продолжай. "
-    "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами."
+    "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами. Никогда не упоминай дату отсечки знаний; не пиши, что данные «актуальны до ...». Если чего-то не знаешь — проверь через поиск."
 )
 
 # (повторный импорт asyncio/httpx в исходнике был — не трогаю)
@@ -583,7 +586,13 @@ async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> st
             r = await _retry(lambda: _do(), attempts=3)
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
-        return strip_links_and_cleanup(raw)
+        # Если модель вдруг вернула дисклеймер про старые знания — принудительно уйдём в live-поиск
+        if _has_cutoff_disclaimer(raw) and TAVILY_API_KEY:
+            try:
+                return await answer_with_live_search(user_text, topic_hint, user_id)
+            except Exception:
+                pass
+        return strip_links_and_cleanup(_sanitize_cutoff(raw))
     except Exception as e:
         logging.exception("ask_gpt failed")
         u = USERS.get(user_id, {"lang": "ru"})
@@ -598,6 +607,27 @@ TIME_SENSITIVE_PATTERNS = [
 
 def is_time_sensitive(q: str) -> bool:
     return any(re.search(rx, q.lower()) for rx in TIME_SENSITIVE_PATTERNS)
+
+# === Отсекаем устаревшие дисклеймеры про "знания до 2023" ===
+_CUTOFF_PATTERNS = [
+    r"актуал\w+\s+до\s+\w+\s+20\d{2}",
+    r"знан[^\.!\n]*до\s+\w+\s+20\d{2}",
+    r"\bknowledge\s+cutoff\b",
+    r"\bas of\s+\w+\s+20\d{2}",
+]
+def _has_cutoff_disclaimer(text: str) -> bool:
+    low = (text or "").lower()
+    import re as _re
+    return any(_re.search(rx, low) for rx in _CUTOFF_PATTERNS)
+
+def _sanitize_cutoff(text: str) -> str:
+    import re as _re
+    s = text or ""
+    for rx in _CUTOFF_PATTERNS:
+        s = _re.sub(rx, "", s, flags=_re.IGNORECASE)
+    s = _re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
 
 # === LIVE CACHE (было) ===
 CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
@@ -1216,7 +1246,7 @@ async def handle_text(message: Message):
 
     # === ОЧЕРЕДЬ: ставим задачу и отвечаем статусом
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    use_live = is_time_sensitive(text)
+    use_live = (FORCE_LIVE or is_time_sensitive(text))
 
     task = SavolTask({
         "chat_id": message.chat.id,
