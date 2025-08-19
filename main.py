@@ -653,7 +653,7 @@ def _looks_dynamic(*texts: str) -> bool:
     return any(k in low for k in _DYNAMIC_KEYWORDS) or _contains_fresh_year(low)
 
 async def verify_with_live_sources(user_text: str, draft_answer: str, topic_hint: Optional[str], user_id: int) -> str:
-    \"\"\"Перепроверяет черновик по live-источникам и при необходимости корректирует цифры/даты.\"\"\"
+    """Перепроверяет черновик по live-источникам и при необходимости корректирует цифры/даты."""
     if not TAVILY_API_KEY:
         return draft_answer
 
