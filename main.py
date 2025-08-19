@@ -599,6 +599,7 @@ TIME_SENSITIVE_PATTERNS = [
 def is_time_sensitive(q: str) -> bool:
     return any(re.search(rx, q.lower()) for rx in TIME_SENSITIVE_PATTERNS)
 
+# === LIVE CACHE (было) ===
 CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
 CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
 LIVE_CACHE: dict[str, dict] = {}
@@ -606,7 +607,7 @@ LIVE_CACHE: dict[str, dict] = {}
 def _norm_query(q: str) -> str:
     return re.sub(r"\s+", " ", q.strip().lower())
 
-def cache_get(q: str):
+def live_cache_get(q: str):
     k = _norm_query(q); it = LIVE_CACHE.get(k)
     if not it:
         return None
@@ -614,7 +615,7 @@ def cache_get(q: str):
         LIVE_CACHE.pop(k, None); return None
     return it["answer"]
 
-def cache_set(q: str, a: str):
+def live_cache_set(q: str, a: str):
     if len(LIVE_CACHE) >= CACHE_MAX_ENTRIES:
         oldest = min(LIVE_CACHE, key=lambda x: LIVE_CACHE[x]["ts"])
         LIVE_CACHE.pop(oldest, None)
@@ -645,7 +646,7 @@ async def web_search_tavily(query: str, max_results: int = 3) -> Optional[dict]:
         return None
 
 async def answer_with_live_search(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
-    c = cache_get(user_text)
+    c = live_cache_get(user_text)
     if c:
         return c
 
@@ -676,14 +677,14 @@ async def answer_with_live_search(user_text: str, topic_hint: Optional[str], use
         r.raise_for_status()
         answer = r.json()["choices"][0]["message"]["content"].strip()
         final = strip_links_and_cleanup(answer)
-        cache_set(user_text, final)
+        live_cache_set(user_text, final)
         return final
     except Exception as e:
         logging.exception("live answer failed")
         u = USERS.get(user_id, {"lang": "ru"})
         return _friendly_error_text(e, u.get("lang", "ru"))
 
-# ================== ВСПОМОГАТЕЛЬНОЕ: эффект «думаю…» =================
+# ================== ВСПОМОГАТЕЛЬНОЕ: эффект «думаю…» (оставлено, но не используется в очереди) =================
 async def send_thinking_progress(message: Message) -> Message:
     try:
         m = await message.answer("⏳ Думаю…")
@@ -732,7 +733,7 @@ TOPICS = {
     "finance": {"title_ru": "Финансы", "title_uz": "Moliya", "hint": "Объясняй с цифрами и примерами. Без рискованных персональных рекомендаций."},
     "gov":     {"title_ru": "Госуслуги", "title_uz": "Davlat xizmatlari", "hint": "Опиши процедуру, документы и шаги подачи."},
     "biz":     {"title_ru": "Бизнес", "title_uz": "Biznes", "hint": "Краткие инструкции по регистрации/отчётности/документам."},
-    "edu":     {"title_ru": "Учёба", "title_уз": "Ta’lim", "hint": "Расскажи про поступление/обучение и шаги."},
+    "edu":     {"title_ru": "Учёба", "title_uz": "Ta’lim", "hint": "Расскажи про поступление/обучение и шаги."},
     "it":      {"title_ru": "IT", "title_uz": "IT", "hint": "Технически и конкретно. Не советуй ничего незаконного."},
     "health":  {"title_ru": "Здоровье (общ.)", "title_uz": "Sog‘liq (umumiy)", "hint": "Только общая информация. Советуй обращаться к врачу."},
 }
@@ -998,6 +999,138 @@ async def cmd_grant_creative(message: Message):
     except Exception:
         logging.warning("Notify user failed")
 
+# ================== QUEUE + CACHE ДЛЯ Q/A ==================
+# --- Очередь задач и оценки ETA
+WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))   # кол-во воркеров
+QUEUE_NOTICE_THRESHOLD = int(os.getenv("QUEUE_NOTICE_THRESHOLD", "3"))
+ETA_MIN_SEC = int(os.getenv("ETA_MIN_SEC", "5"))
+ETA_MAX_SEC = int(os.getenv("ETA_MAX_SEC", "120"))
+
+SAVOL_QUEUE: asyncio.Queue = asyncio.Queue()
+_avg_service_sec: float | None = None
+_service_alpha = float(os.getenv("SERVICE_ALPHA", "0.2"))
+
+# --- Кэш Q/A (точное совпадение вопроса)
+QA_CACHE: dict[str, dict] = {}
+QA_CACHE_MAX = int(os.getenv("QA_CACHE_MAX", "1000"))
+QA_CACHE_TTL = int(os.getenv("QA_CACHE_TTL", "86400"))  # 24h
+
+def _qa_norm(q: str) -> str:
+    return re.sub(r"\s+", " ", q.strip().lower())
+
+def qa_cache_get(q: str) -> Optional[str]:
+    k = _qa_norm(q)
+    it = QA_CACHE.get(k)
+    if not it:
+        return None
+    if time.time() - it["ts"] > QA_CACHE_TTL:
+        QA_CACHE.pop(k, None); return None
+    return it["answer"]
+
+def qa_cache_set(q: str, a: str):
+    k = _qa_norm(q)
+    if len(QA_CACHE) >= QA_CACHE_MAX:
+        oldest = min(QA_CACHE, key=lambda x: QA_CACHE[x]["ts"])
+        QA_CACHE.pop(oldest, None)
+    QA_CACHE[k] = {"ts": time.time(), "answer": a}
+
+def _eta_seconds(pos: int) -> int:
+    if pos <= 1:
+        return ETA_MIN_SEC
+    avg = _avg_service_sec if (_avg_service_sec and _avg_service_sec > 0.1) else 6.0
+    est = int(((pos - 1) * avg) / max(1, WORKER_CONCURRENCY))
+    return max(ETA_MIN_SEC, min(ETA_MAX_SEC, est))
+
+def _update_avg_service(elapsed: float):
+    global _avg_service_sec
+    if _avg_service_sec is None:
+        _avg_service_sec = float(elapsed)
+    else:
+        _avg_service_sec = _service_alpha * float(elapsed) + (1 - _service_alpha) * _avg_service_sec
+
+class SavolTask(dict):
+    """ chat_id, uid, text, lang, topic_hint, use_live """
+    pass
+
+async def _process_task(task: SavolTask):
+    uid = task["uid"]; chat_id = task["chat_id"]; text = task["text"]
+    lang = task["lang"]; topic_hint = task["topic_hint"]; use_live = task["use_live"]
+    t0 = time.time()
+    try:
+        # 1) Кэш Q/A
+        cached = qa_cache_get(text)
+        if cached:
+            try:
+                await bot.send_message(chat_id, f"(из базы) {cached}")
+            except Exception:
+                pass
+            append_history(uid, "assistant", cached)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_sheets_append_history_async(uid, "assistant", cached))
+                loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(cached)), notes="assistant_len_cached"))
+            except RuntimeError:
+                pass
+            return
+
+        # 2) GPT запрос (live или обычный)
+        async def _get_answer():
+            return await (answer_with_live_search(text, topic_hint, uid) if use_live else ask_gpt(text, topic_hint, uid))
+
+        reply = await asyncio.wait_for(_get_answer(), timeout=REPLY_TIMEOUT_SEC)
+        reply = strip_links_and_cleanup(reply)
+
+        # 3) Отправка пользователю
+        try:
+            await bot.send_message(chat_id, reply)
+        except Exception:
+            pass
+
+        # 4) Кэширование
+        qa_cache_set(text, reply)
+
+        # 5) История и метрики
+        append_history(uid, "user", text)      # как было раньше (после ответа)
+        append_history(uid, "assistant", reply)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
+            loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(reply)), notes="assistant_len"))
+        except RuntimeError:
+            pass
+
+    except asyncio.TimeoutError:
+        err_txt = _friendly_error_text(asyncio.TimeoutError(), lang)
+        try:
+            await bot.send_message(chat_id, err_txt)
+        except Exception:
+            pass
+        try:
+            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "timeout"))
+        except RuntimeError:
+            pass
+    except Exception as e:
+        logging.exception("worker _process_task fatal")
+        err_txt = _friendly_error_text(e, lang)
+        try:
+            await bot.send_message(chat_id, err_txt)
+        except Exception:
+            pass
+        try:
+            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "generic", notes=str(e)))
+        except RuntimeError:
+            pass
+    finally:
+        _update_avg_service(time.time() - t0)
+
+async def _queue_worker(name: str):
+    while True:
+        task: SavolTask = await SAVOL_QUEUE.get()
+        try:
+            await _process_task(task)
+        finally:
+            SAVOL_QUEUE.task_done()
+
 # ================== ОБРАБОТЧИК ВОПРОСОВ =================
 @dp.message(F.text)
 async def handle_text(message: Message):
@@ -1081,54 +1214,43 @@ async def handle_text(message: Message):
     except RuntimeError:
         pass
 
-    # Эффект «думаю…»
-    thinking_msg = await send_thinking_progress(message)
-
+    # === ОЧЕРЕДЬ: ставим задачу и отвечаем статусом
     topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
     use_live = is_time_sensitive(text)
 
-    async def _get_answer():
-        return await (answer_with_live_search(text, topic_hint, uid) if use_live else ask_gpt(text, topic_hint, uid))
+    task = SavolTask({
+        "chat_id": message.chat.id,
+        "uid": uid,
+        "text": text,
+        "lang": u.get("lang","ru"),
+        "topic_hint": topic_hint,
+        "use_live": use_live,
+    })
+    SAVOL_QUEUE.put_nowait(task)
 
+    pos = SAVOL_QUEUE.qsize()
+    if pos >= QUEUE_NOTICE_THRESHOLD:
+        eta = _eta_seconds(pos)
+        if u.get("lang","ru") == "uz":
+            ack = f"⏳ So‘rov navbatga qo‘yildi (№{pos}). Taxminiy kutish ~ {eta} soniya. Javob shu yerga keladi."
+        else:
+            ack = f"⏳ Ваш запрос поставлен в очередь (№{pos}). Ожидание ~ {eta} сек. Ответ придёт сюда."
+    else:
+        if u.get("lang","ru") == "uz":
+            ack = "🔎 Qabul qildim! Fikr yuritayapman — javob tez orada keladi."
+        else:
+            ack = "🔎 Принял! Думаю над ответом — пришлю сообщение чуть позже."
+
+    await message.answer(ack)
+
+    append_history(uid, "assistant", ack)
     try:
-        reply = await asyncio.wait_for(_get_answer(), timeout=REPLY_TIMEOUT_SEC)
-        reply = strip_links_and_cleanup(reply)
-        try:
-            await thinking_msg.edit_text(reply)
-        except Exception:
-            await message.answer(reply)
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_append_history_async(uid, "assistant", ack))
+    except RuntimeError:
+        pass
 
-        append_history(uid, "user", text)
-        append_history(uid, "assistant", reply)
-
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
-            loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(reply)), notes="assistant_len"))
-        except RuntimeError:
-            pass
-
-    except asyncio.TimeoutError:
-        err_txt = _friendly_error_text(asyncio.TimeoutError(), u.get("lang","ru"))
-        try:
-            await thinking_msg.edit_text(err_txt)
-        except Exception:
-            await message.answer(err_txt)
-        try:
-            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "timeout"))
-        except RuntimeError:
-            pass
-    except Exception as e:
-        logging.exception("handle_text fatal")
-        err_txt = _friendly_error_text(e, u.get("lang", "ru"))
-        try:
-            await thinking_msg.edit_text(err_txt)
-        except Exception:
-            await message.answer(err_txt)
-        try:
-            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "generic", notes=str(e)))
-        except RuntimeError:
-            pass
+    return
 
 # ================== Lifespan (инициализация/закрытие) =================
 @asynccontextmanager
@@ -1166,9 +1288,24 @@ async def lifespan(app: FastAPI):
         except Exception:
             logging.exception("Failed to set webhook")
 
+    # === ОЧЕРЕДЬ: старт воркеров ===
+    worker_tasks = []
+    try:
+        for i in range(WORKER_CONCURRENCY):
+            worker_tasks.append(asyncio.create_task(_queue_worker(f"w{i+1}")))
+        logging.info("Queue workers started: %s", WORKER_CONCURRENCY)
+    except Exception:
+        logging.exception("Failed to start workers")
+
     try:
         yield
     finally:
+        try:
+            for t in worker_tasks:
+                t.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        except Exception:
+            pass
         try:
             if client_openai:
                 await client_openai.aclose()
