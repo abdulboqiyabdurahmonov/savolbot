@@ -6,6 +6,7 @@ import time
 import logging
 import asyncio
 import random
+from aiogram.types.error_event import ErrorEvent
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -52,6 +53,25 @@ VERIFY_TIMEOUT_SEC = int(os.getenv("VERIFY_TIMEOUT_SEC", "12"))
 
 # Админ
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
+
+# --- Whitelist users (через ENV: WHITELIST_USERS="123,456")
+def _parse_ids(csv: str) -> set[int]:
+    out = set()
+    for chunk in (csv or "").replace(" ", "").split(","):
+        if not chunk:
+            continue
+        try:
+            out.add(int(chunk))
+        except ValueError:
+            pass
+    return out
+
+WHITELIST_USERS: set[int] = _parse_ids(os.getenv("WHITELIST_USERS", ""))
+if ADMIN_CHAT_ID:
+    try:
+        WHITELIST_USERS.add(int(ADMIN_CHAT_ID))
+    except ValueError:
+        pass
 
 # Персистентные файлы
 USERS_DB_PATH = os.getenv("USERS_DB_PATH", "users_limits.json")
@@ -882,13 +902,19 @@ async def cmd_start(message: Message):
         pass
 
 @dp.errors()
-async def on_error(event, exception):
-    logging.exception("Unhandled error: %s | event=%s", exception, repr(event))
+async def on_error(event: ErrorEvent):
+    exc = getattr(event, "exception", None)
+    logging.exception("Unhandled error: %s | event=%s", exc, repr(event))
+
     try:
-        obj = getattr(event, "update", None) or getattr(event, "event", None)
         chat_id = None
-        if obj and hasattr(obj, "message") and obj.message and hasattr(obj.message, "chat"):
-            chat_id = obj.message.chat.id
+        upd = getattr(event, "update", None)
+        if upd:
+            if getattr(upd, "message", None):
+                chat_id = upd.message.chat.id
+            elif getattr(upd, "callback_query", None) and getattr(upd.callback_query, "message", None):
+                chat_id = upd.callback_query.message.chat.id
+
         if chat_id and bot:
             await bot.send_message(chat_id, "⚠️ Внутренняя ошибка обработчика. Попробуйте повторить запрос.")
     except Exception:
