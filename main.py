@@ -5,7 +5,7 @@ import time
 import logging
 import asyncio
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -42,7 +42,7 @@ FORCE_LIVE = os.getenv("FORCE_LIVE", "0") == "1"
 
 # Верификация динамичных ответов (цифры/годы/ставки)
 VERIFY_DYNAMIC = os.getenv("VERIFY_DYNAMIC", "1") == "1"
-VERIFY_TIMEOUT_SEC = int(os.getenv("VERIFY_TIMEOUT_SEC", "10"))
+VERIFY_TIMEOUT_SEC = int(os.getenv("VERIFY_TIMEOUT_SEC", "12"))
 
 # Админ
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # str
@@ -55,11 +55,11 @@ HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "chat_history.json")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON одной строкой (или base64)
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 
-# Названия листов (можно переопределить через ENV)
-USERS_SHEET = os.getenv("USERS_SHEET", "Users")        # лист-реестр пользователей
-HISTORY_SHEET = os.getenv("HISTORY_SHEET", "History")  # лог диалога
-METRICS_SHEET = os.getenv("METRICS_SHEET", "Metrics")  # события/метрики
-FEEDBACK_SHEET = os.getenv("FEEDBACK_SHEET", "Feedback")  # обратная связь
+# Названия листов
+USERS_SHEET = os.getenv("USERS_SHEET", "Users")
+HISTORY_SHEET = os.getenv("HISTORY_SHEET", "History")
+METRICS_SHEET = os.getenv("METRICS_SHEET", "Metrics")
+FEEDBACK_SHEET = os.getenv("FEEDBACK_SHEET", "Feedback")
 
 # --- HTTPX clients & timeouts (reuse) ---
 HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=30.0)
@@ -71,9 +71,9 @@ MODEL_CONCURRENCY = int(os.getenv("MODEL_CONCURRENCY", "4"))
 _model_sem = asyncio.Semaphore(MODEL_CONCURRENCY)
 
 # Общий таймаут на формирование ответа пользователю (секунды)
-REPLY_TIMEOUT_SEC = int(os.getenv("REPLY_TIMEOUT_SEC", "12"))
+REPLY_TIMEOUT_SEC = int(os.getenv("REPLY_TIMEOUT_SEC", "15"))
 
-# Белый список (VIP) — пользователи без ограничений
+# Белый список (VIP)
 WL_RAW = os.getenv("WHITELIST_USERS", "557891018,1942344627")
 try:
     WHITELIST_USERS = {int(x) for x in WL_RAW.split(",") if x.strip().isdigit()}
@@ -97,6 +97,7 @@ def _serialize_user(u: dict) -> dict:
         "paid_until": u["paid_until"].isoformat() if u.get("paid_until") else None,
         "lang": u.get("lang", "ru"),
         "topic": u.get("topic"),
+        "mode": u.get("mode", "gpt"),  # gpt | legal
         "registered_to_sheets": bool(u.get("registered_to_sheets", False)),
     }
 
@@ -127,6 +128,7 @@ def load_users():
                 "paid_until": paid_until,
                 "lang": v.get("lang", "ru"),
                 "topic": v.get("topic"),
+                "mode": v.get("mode", "gpt"),
                 "registered_to_sheets": bool(v.get("registered_to_sheets", False)),
             }
     except Exception:
@@ -148,6 +150,7 @@ def get_user(tg_id: int):
             "paid_until": datetime.utcnow() + timedelta(days=TRIAL_DAYS),
             "lang": "ru",
             "topic": None,
+            "mode": "gpt",
             "registered_to_sheets": False,
         }
         save_users()
@@ -234,23 +237,24 @@ def is_uzbek(text: str) -> bool:
     t = text.lower()
     return bool(re.search(r"[ғқҳў]", t) or re.search(r"\b(ha|yo[’']q|iltimos|rahmat|salom)\b", t))
 
-# ================== АНТИССЫЛКИ =================
+# ================== ССЫЛКИ/ОЧИСТКА =================
 LINK_PAT = re.compile(r"https?://\S+")
 MD_LINK_PAT = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 SOURCES_BLOCK_PAT = re.compile(r"(?is)\n+источники:\s*.*$")
 
-def strip_links(text: str) -> str:
+def strip_links(text: str, allow_links: bool = False) -> str:
     if not text:
         return text
-    text = MD_LINK_PAT.sub(r"\1", text)
-    text = LINK_PAT.sub("", text)
-    text = SOURCES_BLOCK_PAT.sub("", text)
+    if not allow_links:
+        text = MD_LINK_PAT.sub(r"\1", text)
+        text = LINK_PAT.sub("", text)
+        text = SOURCES_BLOCK_PAT.sub("", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
-def strip_links_and_cleanup(text: str) -> str:
-    return strip_links(text or "")
+def strip_links_and_cleanup(text: str, allow_links: bool = False) -> str:
+    return strip_links(text or "", allow_links=allow_links)
 
 # ================== ТАРИФ =================
 TARIFF = {
@@ -317,8 +321,8 @@ def _users_ws_get():
         return sh.worksheet(USERS_SHEET)
     except gspread.WorksheetNotFound:
         try:
-            ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=8)
-            ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until"], value_input_option="RAW")
+            ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=9)
+            ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until", "mode"], value_input_option="RAW")
             return ws
         except Exception:
             logging.exception("Create Users ws failed")
@@ -327,7 +331,7 @@ def _users_ws_get():
         logging.exception("_users_ws failed")
         return None
 
-# --- generic getter для листов с безопасным ensure header (без уменьшения строк) ---
+# --- generic getter ---
 def _ws_get(tab_name: str, headers: list[str]):
     sh = _open_spreadsheet()
     if not sh:
@@ -350,7 +354,7 @@ def _ws_get(tab_name: str, headers: list[str]):
     try:
         need_cols = max(len(headers), 6)
         if getattr(ws, "col_count", 0) < need_cols:
-            ws.resize(cols=need_cols)  # не трогаем rows
+            ws.resize(cols=need_cols)
         end_a1 = rowcol_to_a1(1, len(headers))
         ws.update(f"A1:{end_a1}", [headers], value_input_option="RAW")
     except Exception:
@@ -363,7 +367,7 @@ def _init_sheets():
     Минимальная инициализация Sheets:
     - поддержка raw JSON и base64
     - нормализация private_key с \\n -> \n
-    - Users/History/Metrics/Feedback — создание и заголовки при отсутствии
+    - Users/History/Metrics/Feedback — ensure
     """
     global _sheets_client, _users_ws, LAST_SHEETS_ERROR
     if not (GOOGLE_CREDENTIALS and SHEETS_SPREADSHEET_ID and USERS_SHEET):
@@ -401,8 +405,8 @@ def _init_sheets():
             _users_ws = sh.worksheet(USERS_SHEET)
         except gspread.WorksheetNotFound:
             logging.warning("Worksheet '%s' not found, creating…", USERS_SHEET)
-            _users_ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=8)
-            _users_ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until"], value_input_option="RAW")
+            _users_ws = sh.add_worksheet(title=USERS_SHEET, rows=100000, cols=9)
+            _users_ws.append_row(["ts", "user_id", "username", "first_name", "last_name", "lang", "plan", "paid_until", "mode"], value_input_option="RAW")
         # Ensure другие листы
         _ = _ws_get(HISTORY_SHEET, ["ts","user_id","role","content","col1","col2"])
         _ = _ws_get(METRICS_SHEET, ["ts","user_id","event","value","notes"])
@@ -430,7 +434,7 @@ async def _sheets_register_user_async(user_id: int):
                 return
             paid = u['paid_until'].isoformat() if u.get('paid_until') else ""
             ws.append_row(
-                [datetime.utcnow().isoformat(), str(user_id), "", "", "", u.get('lang', 'ru'), u.get('plan', 'trial'), paid],
+                [datetime.utcnow().isoformat(), str(user_id), "", "", "", u.get('lang', 'ru'), u.get('plan', 'trial'), paid, u.get("mode","gpt")],
                 value_input_option="RAW"
             )
         await asyncio.to_thread(_do)
@@ -439,8 +443,8 @@ async def _sheets_register_user_async(user_id: int):
     except Exception:
         logging.exception("sheets_register_user failed")
 
-async def _sheets_update_user_row_async(user_id: int, username: str, first_name: str, last_name: str, lang: str, plan: str, paid_until: Optional[datetime]):
-    """Упрощённо: добавляем обновлённую строку (последняя версия состояния пользователя)."""
+async def _sheets_update_user_row_async(user_id: int, username: str, first_name: str, last_name: str, lang: str, plan: str, paid_until: Optional[datetime], mode: str):
+    """Упрощённо: добавляем снимок состояния пользователя."""
     if not _users_ws:
         return
     try:
@@ -450,7 +454,7 @@ async def _sheets_update_user_row_async(user_id: int, username: str, first_name:
                 return
             paid = paid_until.isoformat() if paid_until else ""
             ws.append_row(
-                [datetime.utcnow().isoformat(), str(user_id), username or "", first_name or "", last_name or "", lang or "ru", plan or "", paid],
+                [datetime.utcnow().isoformat(), str(user_id), username or "", first_name or "", last_name or "", lang or "ru", plan or "", paid, mode or "gpt"],
                 value_input_option="RAW"
             )
         await asyncio.to_thread(_do)
@@ -554,65 +558,43 @@ def _friendly_error_text(e, lang="ru"):
 
 # ================== ИИ =================
 BASE_SYSTEM_PROMPT = (
-    "Ты — SavolBot (часть TripleA). Отвечай естественно и по делу: 6–8 предложений, без канцелярита, "
-    "с примерами и списками по месту. Лёгкий юмор допустим. Соблюдай законы Узбекистана. "
-    "Не давай инструкций для незаконных действий. По медицине — только общая справка и совет обратиться к врачу. "
-    "Язык ответа = язык вопроса (RU/UZ). Никогда не вставляй ссылки и URL. "
-    "Если контекста мало — вежливо попроси напомнить ключевые детали и продолжай. "
-    "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами. Никогда не упоминай дату отсечки знаний; не пиши, что данные «актуальны до ...». Если чего-то не знаешь — проверь через поиск."
+    "Ты — SavolBot (часть TripleA). Режим: повседневный помощник. Отвечай естественно и по делу: 6–8 предложений, "
+    "с примерами и короткими списками. Лёгкий юмор допустим. Соблюдай законы Узбекистана. "
+    "Не давай инструкций для незаконных действий. По медицине — только общая справка + совет обратиться к врачу. "
+    "Язык ответа = язык вопроса (RU/UZ). В этом режиме не вставляй URL и ссылки. "
+    "Если вопрос про актуальные данные — используй сводку из поиска, но отвечай своими словами. "
+    "Никогда не упоминай дату отсечки знаний. Если чего-то не знаешь — проверь через поиск или честно признайся."
 )
 
-# (повторный импорт asyncio/httpx в исходнике был — не трогаю)
-import asyncio as _asyncio_shadow  # не используется, оставлено для совместимости
-import httpx as _httpx_shadow     # не используется, оставлено для совместимости
+LEGAL_SYSTEM_PROMPT = (
+    "Ты — SavolBot (TripleA), режим ⚖️ Юридический консультант по законодательству Республики Узбекистан. "
+    "Дай обобщённую правовую информацию, НЕ индивидуальную юридическую консультацию. "
+    "Обязательно опирайся на Актуальные НПА из lex.uz (закон, кодекс, постановление и др.). "
+    "Требования: 1) укажи точные названия актов и номера статей/пунктов; 2) добавь ссылки на lex.uz; "
+    "3) не используй сторонние источники; 4) если релевантной нормы не найдено или есть риск устаревания — прямо напиши об этом; "
+    "5) не выдумывай. Язык ответа = язык вопроса (RU/UZ). Структура: краткое резюме, что разрешено/запрещено, "
+    "процедура (шаги, документы, сроки и органы), ответственность/штрафы (если применимо), 'Источники' (список ссылок lex.uz), "
+    "и строка 'Проверено: <дата по Ташкенту>'."
+)
 
-# Семафор для ограничения одновременных запросов к модели
+# (повторный импорт asyncio/httpx в исходнике был — оставляем)
+import asyncio as _asyncio_shadow  # noqa: F401
+import httpx as _httpx_shadow     # noqa: F401
+
+# Семафор (safety)
 if not isinstance(_model_sem, asyncio.Semaphore):
     _model_sem = asyncio.Semaphore(MODEL_CONCURRENCY)
 
-async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
-    if not OPENAI_API_KEY:
-        return f"Вы спросили: {user_text}"
-
-    system = BASE_SYSTEM_PROMPT + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.6,
-        "messages": build_messages(user_id, system, user_text),
-    }
-
-    async def _do():
-        return await client_openai.post("/chat/completions", headers=headers, json=payload)
-
-    try:
-        async with _model_sem:
-            r = await _retry(lambda: _do(), attempts=3)
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"].strip()
-        # Если модель вдруг вернула дисклеймер про старые знания — принудительно уйдём в live-поиск
-        if _has_cutoff_disclaimer(raw) and TAVILY_API_KEY:
-            try:
-                return await answer_with_live_search(user_text, topic_hint, user_id)
-            except Exception:
-                pass
-        return strip_links_and_cleanup(_sanitize_cutoff(raw))
-    except Exception as e:
-        logging.exception("ask_gpt failed")
-        u = USERS.get(user_id, {"lang": "ru"})
-        return _friendly_error_text(e, u.get("lang", "ru"))
-
+# ==== Динамика/актуальность ====
 TIME_SENSITIVE_PATTERNS = [
     r"\b(сегодня|сейчас|на данный момент|актуальн|в \d{4} году|в 20\d{2})\b",
     r"\b(курс|зарплат|инфляц|ставк|цена|новост|статистик|прогноз)\b",
     r"\b(bugun|hozir|narx|kurs|yangilik)\b",
     r"\b(кто|как зовут|председател|директор|ceo|руководител)\b",
 ]
-
 def is_time_sensitive(q: str) -> bool:
     return any(re.search(rx, q.lower()) for rx in TIME_SENSITIVE_PATTERNS)
 
-# === Отсекаем устаревшие дисклеймеры про "знания до 2023" ===
 _CUTOFF_PATTERNS = [
     r"актуал\w+\s+до\s+\w+\s+20\d{2}",
     r"знан[^\.!\n]*до\s+\w+\s+20\d{2}",
@@ -632,9 +614,6 @@ def _sanitize_cutoff(text: str) -> str:
     s = _re.sub(r"\n{3,}", "\n\n", s).strip()
     return s
 
-
-
-# === Эвристики «динамичности» и верификация ответа ===
 _DYNAMIC_KEYWORDS = [
     "курс", "ставк", "инфляц", "зарплат", "налог", "цена", "тариф", "пособи", "пенси", "кредит",
     "новост", "прогноз", "изменени", "обновлени", "statistika", "narx", "stavka", "yangilik", "price", "rate",
@@ -645,15 +624,180 @@ def _contains_fresh_year(s: str, window: int = 3) -> bool:
         y_now = datetime.utcnow().year
     except Exception:
         y_now = 2025
-    years = [int(y) for y in _re2.findall(r"\\b(20\\d{2})\\b", s or "")]
+    years = [int(y) for y in _re2.findall(r"\b(20\d{2})\b", s or "")]
     return any(y_now - y <= window for y in years)
 
 def _looks_dynamic(*texts: str) -> bool:
     low = " ".join([t.lower() for t in texts if t])
     return any(k in low for k in _DYNAMIC_KEYWORDS) or _contains_fresh_year(low)
 
+def _tz_tashkent_date() -> str:
+    # Ташкент = UTC+5, без DST
+    dt = datetime.utcnow() + timedelta(hours=5)
+    return dt.strftime("%d.%m.%Y")
+
+# ================== ВНЕШНИЕ ЗАПРОСЫ (GPT + Поиск) =================
+async def ask_gpt(user_text: str, topic_hint: Optional[str], user_id: int, system_prompt: str, allow_links: bool) -> str:
+    if not OPENAI_API_KEY:
+        return f"Вы спросили: {user_text}"
+
+    system = system_prompt + (f" Учитывай контекст темы: {topic_hint}" if topic_hint else "")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.6,
+        "messages": build_messages(user_id, system, user_text),
+    }
+
+    async def _do():
+        return await client_openai.post("/chat/completions", headers=headers, json=payload)
+
+    try:
+        async with _model_sem:
+            r = await _retry(lambda: _do(), attempts=3)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        if _has_cutoff_disclaimer(raw) and TAVILY_API_KEY:
+            try:
+                # fallback на live-поиск, если модель начала «cutoff-нить»
+                return await answer_with_live_search(user_text, topic_hint, user_id, system_prompt, allow_links=allow_links)
+            except Exception:
+                pass
+        return strip_links_and_cleanup(_sanitize_cutoff(raw), allow_links=allow_links)
+    except Exception as e:
+        logging.exception("ask_gpt failed")
+        u = USERS.get(user_id, {"lang": "ru"})
+        return _friendly_error_text(e, u.get("lang", "ru"))
+
+async def web_search_tavily(query: str, max_results: int = 3, include_domains: Optional[list[str]] = None, depth: Optional[str] = None) -> Optional[dict]:
+    if not TAVILY_API_KEY:
+        return None
+    if depth is None:
+        depth = "advanced" if is_time_sensitive(query) else "basic"
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": depth,
+        "max_results": max_results,
+        "include_answer": True,
+        "include_domains": include_domains or [],
+    }
+
+    async def _do():
+        return await client_http.post("https://api.tavily.com/search", json=payload)
+
+    try:
+        r = await _retry(lambda: _do(), attempts=2)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.warning("tavily search failed: %s", e)
+        return None
+
+# --- Everyday (GPT) с live ---
+async def answer_with_live_search(user_text: str, topic_hint: Optional[str], user_id: int, system_prompt: str, allow_links: bool = False) -> str:
+    data = await web_search_tavily(user_text, max_results=4)
+    if not data:
+        return await ask_gpt(user_text, topic_hint, user_id, system_prompt, allow_links=allow_links)
+
+    snippets = []
+    for it in (data.get("results") or [])[:4]:
+        title = (it.get("title") or "")[:100]
+        content = (it.get("content") or "")[:500]
+        snippets.append(f"- {title}\n{content}")
+
+    # В повседневном режиме ссылки вырезаются, поэтому «без URL»
+    system = system_prompt + " Отвечай, опираясь на сводку (без ссылок в тексте). Кратко, по делу."
+    if topic_hint:
+        system += f" Учитывай контекст: {topic_hint}"
+    user_aug = f"{user_text}\n\nСВОДКА ИСТОЧНИКОВ (без URL):\n" + "\n\n".join(snippets)
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {"model": OPENAI_MODEL, "temperature": 0.35, "messages": build_messages(user_id, system, user_aug)}
+
+    async def _do():
+        return await client_openai.post("/chat/completions", headers=headers, json=payload)
+
+    try:
+        async with _model_sem:
+            r = await _retry(lambda: _do(), attempts=3)
+        r.raise_for_status()
+        answer = r.json()["choices"][0]["message"]["content"].strip()
+        final = strip_links_and_cleanup(_sanitize_cutoff(answer), allow_links=allow_links)
+
+        # Проставим отметку проверки для динамики
+        if _looks_dynamic(user_text, final):
+            mark = f"\n\n_Проверено: {_tz_tashkent_date()}_"
+            if allow_links:
+                final = final + mark
+            else:
+                final = final + mark
+        return final
+    except Exception as e:
+        logging.exception("live answer failed")
+        u = USERS.get(user_id, {"lang": "ru"})
+        return _friendly_error_text(e, u.get("lang", "ru"))
+
+# --- LEGAL (только lex.uz, обязательно ссылки) ---
+async def legal_answer(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
+    # Ищем только по lex.uz
+    data = await web_search_tavily(user_text, max_results=6, include_domains=["lex.uz"], depth="advanced")
+    snippets = []
+    links = []
+    if data and (data.get("results") or []):
+        for it in (data.get("results") or [])[:6]:
+            title = (it.get("title") or "")[:120]
+            content = (it.get("content") or "")[:600]
+            url = (it.get("url") or "").strip()
+            if url and "lex.uz" in url:
+                links.append((title, url))
+            snippets.append(f"- {title}\n{content}")
+    # Если нет ссылок на lex.uz — честно признаём
+    if not links:
+        # всё равно попробуем аккуратно ответить без выдумок
+        base = "К сожалению, не удалось найти релевантные нормы на lex.uz по вашему запросу. Уточните формулировки (вид акта, орган, период) или задайте более конкретный вопрос."
+        return base + f"\n\n_Проверено: {_tz_tashkent_date()}_"
+
+    system = LEGAL_SYSTEM_PROMPT + " Всегда включай блок 'Источники' с прямыми ссылками на lex.uz (Markdown)."
+    if topic_hint:
+        system += f" Контекст темы: {topic_hint}"
+    # Для юр-режима передаём и сводку, и список URL — модель должна процитировать статьи и сослаться
+    sources_block = "\n".join([f"- [{t}]({u})" for t, u in links])
+    user_aug = (
+        f"{user_text}\n\nСВОДКА НОРМ (из lex.uz):\n" + "\n\n".join(snippets) +
+        "\n\nСсылки на первоисточники (lex.uz):\n" + sources_block
+    )
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {"model": OPENAI_MODEL, "temperature": 0.2, "messages": build_messages(user_id, system, user_aug)}
+
+    async def _do():
+        return await client_openai.post("/chat/completions", headers=headers, json=payload)
+
+    try:
+        async with _model_sem:
+            r = await _retry(lambda: _do(), attempts=3)
+        r.raise_for_status()
+        ans = r.json()["choices"][0]["message"]["content"].strip()
+        ans = _sanitize_cutoff(ans)
+        # В юр-режиме ссылки разрешены:
+        ans = strip_links_and_cleanup(ans, allow_links=True)
+
+        # Страховка: если модель вдруг не вставила блок «Источники», добавим сами.
+        if "Источники" not in ans and "Manbalar" not in ans:
+            ans += "\n\n**Источники:**\n" + "\n".join([f"- [{t}]({u})" for t, u in links])
+
+        # Добавим дату проверки:
+        if "_Проверено:" not in ans and "Tekshirildi:" not in ans:
+            ans += f"\n\n_Проверено: {_tz_tashkent_date()}_"
+        return ans
+    except Exception as e:
+        logging.exception("legal_answer failed")
+        u = USERS.get(user_id, {"lang": "ru"})
+        return _friendly_error_text(e, u.get("lang", "ru"))
+
+# === Верификация черновика (используется только в повседневном режиме) ===
 async def verify_with_live_sources(user_text: str, draft_answer: str, topic_hint: Optional[str], user_id: int) -> str:
-    """Перепроверяет черновик по live-источникам и при необходимости корректирует цифры/даты."""
     if not TAVILY_API_KEY:
         return draft_answer
 
@@ -665,21 +809,20 @@ async def verify_with_live_sources(user_text: str, draft_answer: str, topic_hint
     for it in (data.get("results") or [])[:5]:
         title = (it.get("title") or "")[:100]
         content = (it.get("content") or "")[:400]
-        snippets.append(f"- {title}\\n{content}")
+        snippets.append(f"- {title}\n{content}")
 
     system = (
         BASE_SYSTEM_PROMPT
-        + " Проверь факты и при необходимости скорректируй числа/даты/ставки на основе источников. "
-          "Если исправляешь — чётко перепиши фрагменты, не ссылайся на URL, не упоминай 'источники ниже'. "
-          "Пиши компактно, без дисклеймеров об отсечке знаний."
+        + " Проверь цифры/даты/ставки по источникам ниже и скорректируй, если нужно. "
+          "Ссылки в ответ не вставляй, пиши своими словами."
     )
     if topic_hint:
         system += f" Учитывай контекст темы: {topic_hint}"
 
-    user_aug = (\
-        "ВОПРОС:\\n" + (user_text or "") + "\\n\\n"
-        "ЧЕРНОВИК ОТВЕТА:\\n" + (draft_answer or "") + "\\n\\n"
-        "СВОДКА ИСТОЧНИКОВ (без ссылок):\\n" + "\\n\\n".join(snippets)
+    user_aug = (
+        "ВОПРОС:\n" + (user_text or "") + "\n\n"
+        "ЧЕРНОВИК:\n" + (draft_answer or "") + "\n\n"
+        "СВОДКА ИСТОЧНИКОВ (без URL):\n" + "\n\n".join(snippets)
     )
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -693,13 +836,12 @@ async def verify_with_live_sources(user_text: str, draft_answer: str, topic_hint
             r = await _retry(lambda: _do(), attempts=2)
         r.raise_for_status()
         corrected = r.json()["choices"][0]["message"]["content"].strip()
-        corrected = strip_links_and_cleanup(_sanitize_cutoff(corrected))
-        # Если модель вернула пусто — оставим черновик
+        corrected = strip_links_and_cleanup(_sanitize_cutoff(corrected), allow_links=False)
         return corrected if corrected else draft_answer
     except Exception:
         return draft_answer
 
-# === LIVE CACHE (было) ===
+# === LIVE CACHE (оставляем; для юр-режима кэш по умолчанию отключим, чтобы не держать старьё) ===
 CACHE_TTL_SECONDS = int(os.getenv("LIVE_CACHE_TTL", "86400"))
 CACHE_MAX_ENTRIES = int(os.getenv("LIVE_CACHE_MAX", "500"))
 LIVE_CACHE: dict[str, dict] = {}
@@ -721,80 +863,7 @@ def live_cache_set(q: str, a: str):
         LIVE_CACHE.pop(oldest, None)
     LIVE_CACHE[_norm_query(q)] = {"ts": time.time(), "answer": a}
 
-async def web_search_tavily(query: str, max_results: int = 3) -> Optional[dict]:
-    if not TAVILY_API_KEY:
-        return None
-    depth = "advanced" if is_time_sensitive(query) else "basic"
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": depth,
-        "max_results": max_results,
-        "include_answer": True,
-        "include_domains": [],
-    }
-
-    async def _do():
-        return await client_http.post("https://api.tavily.com/search", json=payload)
-
-    try:
-        r = await _retry(lambda: _do(), attempts=2)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logging.warning("tavily search failed: %s", e)
-        return None
-
-async def answer_with_live_search(user_text: str, topic_hint: Optional[str], user_id: int) -> str:
-    c = live_cache_get(user_text)
-    if c:
-        return c
-
-    data = await web_search_tavily(user_text)
-    if not data:
-        return await ask_gpt(user_text, topic_hint, user_id)
-
-    snippets = []
-    for it in (data.get("results") or [])[:3]:
-        title = (it.get("title") or "")[:80]
-        content = (it.get("content") or "")[:350]
-        snippets.append(f"- {title}\n{content}")
-
-    system = BASE_SYSTEM_PROMPT + " Отвечай, опираясь на источники (но без ссылок). Кратко, по делу."
-    if topic_hint:
-        system += f" Учитывай контекст темы: {topic_hint}"
-    user_aug = f"{user_text}\n\nИСТОЧНИКИ (сводка без URL):\n" + "\n\n".join(snippets)
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {"model": OPENAI_MODEL, "temperature": 0.3, "messages": build_messages(user_id, system, user_aug)}
-
-    async def _do():
-        return await client_openai.post("/chat/completions", headers=headers, json=payload)
-
-    try:
-        async with _model_sem:
-            r = await _retry(lambda: _do(), attempts=3)
-        r.raise_for_status()
-        answer = r.json()["choices"][0]["message"]["content"].strip()
-        final = strip_links_and_cleanup(answer)
-        live_cache_set(user_text, final)
-        return final
-    except Exception as e:
-        logging.exception("live answer failed")
-        u = USERS.get(user_id, {"lang": "ru"})
-        return _friendly_error_text(e, u.get("lang", "ru"))
-
-# ================== ВСПОМОГАТЕЛЬНОЕ: эффект «думаю…» (оставлено, но не используется в очереди) =================
-async def send_thinking_progress(message: Message) -> Message:
-    try:
-        m = await message.answer("⏳ Думаю…")
-        await asyncio.sleep(0.4)
-        await m.edit_text("🔎 Собираю информацию…")
-        return m
-    except Exception:
-        return await message.answer("🔎 Собираю информацию…")
-
-# ================== FEEDBACK UI =================
+# ================== ВСПОМОГАТЕЛЬНОЕ =================
 def feedback_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -805,27 +874,24 @@ def feedback_kb():
         [InlineKeyboardButton(text="↩️ Закрыть", callback_data="fb:close")],
     ])
 
-# флаг ожидания комментария: {user_id}
 FEEDBACK_PENDING: set[int] = set()
 
-# ================== КОМАНДЫ =================
+# ================== КОМАНДЫ/ТЕКСТЫ =================
 WELCOME_RU = (
     "👋 Привет! Я — SavolBot, часть команды TripleA.\n"
-    "Мы делаем автообзвоны, чат-боты и GPT в Telegram. "
-    "Наш плюс: удобный доступ к ChatGPT прямо в Telegram — всего за $10/мес (вместо $20 у официальной подписки).\n\n"
-    "Тариф: ⭐ Creative — генерирую картинки, помогаю с документами, без лимитов сообщений. "
-    "Сейчас действует 7-дневный бесплатный период. Потом — $10/мес.\n\n"
-    "Полезное: /tariffs — про тариф, /myplan — мой план, /topics — выбрать тему.\n"
-    "Пиши вопрос — начнём!"
+    "Теперь у меня ДВА режима:\n"
+    "• 👤 Повседневный помощник (GPT)\n"
+    "• ⚖️ Юридический консультант (только lex.uz, без фантазий)\n\n"
+    "Тариф ⭐ Creative: $10/мес, 7 дней бесплатно. /tariffs\n"
+    "Переключить режим: /mode  • Правила юр-раздела: /legal_rules"
 )
 WELCOME_UZ = (
-    "👋 Salom! Men — SavolBot, TripleA jamoasining qismi.\n"
-    "Biz avtoqo‘ng‘iroqlar, chat-botlar va Telegramda GPT xizmatlarini qilamiz. "
-    "Afzalligimiz: ChatGPT’ga Telegramning o‘zida qulay kirish — oyiga atigi $10 (rasmiy $20 o‘rniga).\n\n"
-    "Tarif: ⭐ Creative — suratlar generatsiyasi, hujjatlar bo‘yicha yordam, cheklanmagan xabarlar. "
-    "Hozir 7 kunlik bepul davr. Keyin — $10/oy.\n\n"
-    "Foydali: /tariffs — tarif, /myplan — reja, /topics — mavzu tanlash.\n"
-    "Savolingizni yozing — boshlaymiz!"
+    "👋 Salom! Men — SavolBot, TripleA jamoasi.\n"
+    "Endi IKKI rejim:\n"
+    "• 👤 Kundalik yordamchi (GPT)\n"
+    "• ⚖️ Yuridik maslahatchi (faqat lex.uz)\n\n"
+    "⭐ Creative: $10/oy, 7 kun bepul. /tariffs\n"
+    "Rejimni almashtirish: /mode  • Qoidalar: /legal_rules"
 )
 
 TOPICS = {
@@ -848,6 +914,34 @@ def topic_kb(lang="ru", current=None):
     rows.append([InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="topic:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def mode_kb(current: str = "gpt"):
+    gpt_label = "✅ 👤 Повседневный (GPT)" if current == "gpt" else "👤 Повседневный (GPT)"
+    legal_label = "✅ ⚖️ Юридический (lex.uz)" if current == "legal" else "⚖️ Юридический (lex.uz)"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=gpt_label, callback_data="mode:gpt")],
+        [InlineKeyboardButton(text=legal_label, callback_data="mode:legal")],
+        [InlineKeyboardButton(text="↩️ Закрыть", callback_data="mode:close")],
+    ])
+
+LEGAL_RULES_RU = (
+    "⚖️ Раздел «Юридические вопросы» — правила:\n"
+    "1) Это не индивидуальная юридическая консультация, а обобщённая информация.\n"
+    "2) Источник — только текущая редакция НПА на lex.uz (законы, кодексы, постановления и т.п.).\n"
+    "3) В ответе обязательно: название акта, статья/пункт, и ссылка на lex.uz.\n"
+    "4) Если нет прямой нормы или есть риск устаревания — честно сообщаю и прошу уточнить.\n"
+    "5) Никаких «домыслов» и ссылок на сторонние сайты.\n"
+    "Для переключения режима используйте /mode."
+)
+LEGAL_RULES_UZ = (
+    "⚖️ “Yuridik savollar” bo‘limi — qoidalar:\n"
+    "1) Bu individual yuridik maslahat emas, umumiy ma’lumotdir.\n"
+    "2) Manba — faqat lex.uz dagi amaldagi me’yoriy hujjatlar (qonun, kodeks, qaror va h.k.).\n"
+    "3) Javobda albatta: hujjat nomi, modda/band va lex.uz havolasi bo‘ladi.\n"
+    "4) Aniq norma topilmasa yoki eskirgan bo‘lishi mumkin — ochiq aytaman, aniqlik so‘rayman.\n"
+    "5) Boshqa saytlarga havola yo‘q, taxmin yo‘q.\n"
+    "Rejimni /mode orqali almashtiring."
+)
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
@@ -869,9 +963,16 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     u = get_user(message.from_user.id)
-    txt = "ℹ️ Напишите вопрос (RU/UZ). Я умею генерировать картинки и помогать с документами.\n/tariffs — тариф, /myplan — план, /topics — тема." \
-        if u["lang"] == "ru" else \
-        "ℹ️ Savolingizni yozing (RU/UZ). Surat generatsiyasi va hujjatlar bo‘yicha yordam.\n/tariffs — tarif, /myplan — reja, /topics — mavzu."
+    if u["lang"] == "ru":
+        txt = (
+            "ℹ️ Я умею: повседневные ответы (GPT) и юр-раздел по lex.uz.\n"
+            "/tariffs — тариф, /myplan — план, /topics — темы, /mode — переключение режимов, /legal_rules — правила юр-раздела."
+        )
+    else:
+        txt = (
+            "ℹ️ Men kundalik rejim (GPT) va yuridik bo‘lim (faqat lex.uz) bilan ishlayman.\n"
+            "/tariffs, /myplan, /topics, /mode, /legal_rules — foydali buyruqlar."
+        )
     await message.answer(txt)
     try:
         asyncio.get_running_loop().create_task(_sheets_append_history_async(message.from_user.id, "assistant", txt))
@@ -882,365 +983,195 @@ async def cmd_help(message: Message):
 async def cmd_about(message: Message):
     u = get_user(message.from_user.id)
     txt = (
-        "🤖 SavolBot от TripleA: автообзвоны, чат-боты и GPT в Telegram. "
-        "Creative — $10/мес, 7 дней бесплатно. /tariffs"
-        if u["lang"] == "ru"
-        else "🤖 SavolBot (TripleA): avtoqo‘ng‘iroqlar, chat-botlar, Telegramda GPT. "
-             "Creative — $10/oy, 7 kun bepul. /tariffs"
-    )
-    await message.answer(txt)
-
-@dp.message(Command("tariffs"))
-async def cmd_tariffs(message: Message):
-    u = get_user(message.from_user.id)
-    await message.answer(tariffs_text(u["lang"]), reply_markup=pay_kb())
-
-@dp.message(Command("myplan"))
-async def cmd_myplan(message: Message):
-    u = get_user(message.from_user.id)
-    status = "активна" if has_active_sub(u) else "нет"
-    until = u["paid_until"].isoformat() if u.get("paid_until") else "—"
-    topic = u.get("topic") or "—"
-    is_wl = is_whitelisted(message.from_user.id)
-    plan_label = "whitelist (безлимит)" if is_wl else u.get("plan", "trial")
-    await message.answer(
-        f"Ваш план: {plan_label}\nПодписка активна: {status} (до {until})\nТема: {topic}"
+        "🤖 SavolBot от TripleA — два режима:\n"
+        "1) 🧰 Помощник по повседневным вопросам (GPT): идеи, тексты, советы.\n"
+        "2) ⚖️ Юридический консультант: только по законам РУз, с прямыми ссылками на lex.uz, без домыслов.\n\n"
+        "Команды:\n"
+        "/mode — выбрать режим\n"
+        "/tariffs — тариф\n"
+        "/myplan — мой план\n"
+        "/topics — темы (для GPT)\n"
+        "/new — очистить контекст"
         if u["lang"] == "ru" else
-        f"Rejangiz: {plan_label}\nFaollik: {status} (gacha {until})\nMavzu: {topic}"
+        "🤖 SavolBot (TripleA) — ikki rejim:\n"
+        "1) 🧰 Kundalik yordamchi (GPT): g‘oyalar, matnlar, maslahatlar.\n"
+        "2) ⚖️ Yuridik maslahatchi: faqat O‘zR qonunlari bo‘yicha, lex.uz havolalari bilan, taxminsiz.\n\n"
+        "Buyruqlar:\n"
+        "/mode — rejim tanlash\n"
+        "/tariffs — tarif\n"
+        "/myplan — reja\n"
+        "/topics — mavzular (GPT uchun)\n"
+        "/new — kontekstni tozalash"
     )
-
-@dp.message(Command("topics"))
-async def cmd_topics(message: Message):
-    u = get_user(message.from_user.id); lang = u["lang"]
-    head = "🗂 Выберите тему:" if lang == "ru" else "🗂 Mavzuni tanlang:"
-    await message.answer(head, reply_markup=topic_kb(lang, current=u.get("topic")))
-
-@dp.message(Command("new"))
-async def cmd_new(message: Message):
-    reset_history(message.from_user.id)
-    txt = "🧹 Контекст очищен. Начинаем новую тему." if get_user(message.from_user.id)["lang"] == "ru" else "🧹 Kontekst tozalandi. Yangi mavzu."
     await message.answer(txt)
 
-# -------- Feedback командой ----------
-@dp.message(Command("feedback"))
-async def cmd_feedback(message: Message):
+# ================== РЕЖИМЫ: GPT / LEGAL ==================
+# У пользователя появится поле mode: "gpt" (по умолчанию) или "legal"
+def get_mode(user_id: int) -> str:
+    u = get_user(user_id)
+    if not u.get("mode"):
+        u["mode"] = "gpt"
+        save_users()
+    return u["mode"]
+
+def set_mode(user_id: int, mode: str):
+    u = get_user(user_id)
+    u["mode"] = mode
+    save_users()
+
+def mode_kb(lang="ru", current=None):
+    gpt = "🧰 GPT-помощник" if lang == "ru" else "🧰 GPT-yordamchi"
+    legal = "⚖️ Юридический консультант" if lang == "ru" else "⚖️ Yuridik maslahatchi"
+    rows = [[InlineKeyboardButton(text=("✅ " + gpt) if current == "gpt" else gpt, callback_data="mode:gpt")],
+            [InlineKeyboardButton(text=("✅ " + legal) if current == "legal" else legal, callback_data="mode:legal")],
+            [InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="mode:close")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.message(Command("mode"))
+async def cmd_mode(message: Message):
     u = get_user(message.from_user.id)
-    txt = "Вам удобно пользоваться нашим ботом?" if u["lang"] == "ru" else "Bizning botdan foydalanish qulaymi?"
-    await message.answer(txt, reply_markup=feedback_kb())
-    try:
-        asyncio.get_running_loop().create_task(_sheets_append_metric_async(message.from_user.id, "feedback_prompt", "manual"))
-    except RuntimeError:
-        pass
+    await message.answer("Выберите режим:" if u["lang"] == "ru" else "Rejimni tanlang:", 
+                         reply_markup=mode_kb(u.get("lang","ru"), current=get_mode(message.from_user.id)))
 
-# -------- Sheets диагностика ----------
-@dp.message(Command("gs_debug"))
-async def cmd_gs_debug(message: Message):
-    has_env = all([GOOGLE_CREDENTIALS, SHEETS_SPREADSHEET_ID, USERS_SHEET])
-    await message.answer(
-        "ENV OK: {env}\nID: {sid}\nUsers WS: {ws}\nCred len: {cl}\nUsers inited: {ok}\nErr: {err}".format(
-            env=has_env,
-            sid=SHEETS_SPREADSHEET_ID or "—",
-            ws=USERS_SHEET or "—",
-            cl=len(GOOGLE_CREDENTIALS or ""),
-            ok=bool(_users_ws),
-            err=LAST_SHEETS_ERROR or "—",
-        )
-    )
-
-@dp.message(Command("gs_reinit"))
-async def cmd_gs_reinit(message: Message):
-    _init_sheets()
-    await message.answer("Reinit → " + ("✅ OK" if _users_ws else f"❌ Fail: {LAST_SHEETS_ERROR}"))
-
-@dp.message(Command("gs_users"))
-async def cmd_gs_users(message: Message):
-    try:
-        if not _sheets_client:
-            return await message.answer("❌ Sheets client не инициализирован. /gs_reinit")
-        sh = _sheets_client.open_by_key(SHEETS_SPREADSHEET_ID)
-        titles = [ws.title for ws in sh.worksheets()]
-        await message.answer("Листы в таблице:\n" + "\n".join("• " + t for t in titles))
-    except Exception as e:
-        logging.exception("gs_users failed")
-        await message.answer(f"❌ gs_users ошибка: {e}")
-
-# ================== CALLBACKS (оплата) =================
-@dp.callback_query(F.data == "show_tariffs")
-async def cb_show_tariffs(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("mode:"))
+async def cb_mode(call: CallbackQuery):
     u = get_user(call.from_user.id)
-    await call.message.edit_text(tariffs_text(u["lang"]), reply_markup=pay_kb())
-    await call.answer()
-
-@dp.callback_query(F.data == "subscribe_creative")
-async def cb_subscribe_creative(call: CallbackQuery):
-    pay_link = "https://pay.example.com/savolbot/creative"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Я оплатил", callback_data="paid_creative_done")]
-    ])
-    txt = (
-        f"💳 Тариф ⭐ Creative — ${TARIFF['creative']['price_usd']}/мес.\nОплата: {pay_link}\n"
-        f"После оплаты нажмите кнопку ниже."
-    )
-    await call.message.answer(txt, reply_markup=kb)
-    await call.answer()
-
-@dp.callback_query(F.data == "paid_creative_done")
-async def cb_paid_done(call: CallbackQuery):
-    if ADMIN_CHAT_ID and bot:
-        try:
-            await bot.send_message(
-                int(ADMIN_CHAT_ID),
-                f"👤 @{call.from_user.username or call.from_user.id} запросил активацию «Creative».\n"
-                f"TG ID: {call.from_user.id}\nИспользуйте /grant_creative {call.from_user.id}"
-            )
-        except Exception:
-            logging.exception("Notify admin failed")
-    await call.message.answer("Спасибо! Мы проверим оплату и активируем подписку.")
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("topic:"))
-async def cb_topic(call: CallbackQuery):
-    u = get_user(call.from_user.id)
-    _, key = call.data.split(":", 1)
-    if key == "close":
+    _, m = call.data.split(":", 1)
+    if m == "close":
         try:
             await call.message.delete()
         except Exception:
             pass
         return await call.answer("OK")
-    if key in TOPICS:
-        u["topic"] = key; save_users()
-        lang = u["lang"]; title = TOPICS[key]["title_uz"] if lang == "uz" else TOPICS[key]["title_ru"]
-        await call.message.edit_reply_markup(reply_markup=topic_kb(lang, current=key))
-        await call.answer(f"Выбрана тема: {title}" if lang == "ru" else f"Mavzu tanlandi: {title}")
-
-# ================== CALLBACKS (feedback) =================
-@dp.callback_query(F.data == "fb:close")
-async def cb_fb_close(call: CallbackQuery):
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-    await call.answer("Спасибо!")
-
-@dp.callback_query(F.data == "fb:ok")
-async def cb_fb_ok(call: CallbackQuery):
-    uid = call.from_user.id
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_sheets_append_feedback_async(
-            uid,
-            call.from_user.username or "",
-            call.from_user.first_name or "",
-            call.from_user.last_name or "",
-            "ok",
-            ""
-        ))
-        loop.create_task(_sheets_append_metric_async(uid, "feedback", "ok"))
-    except RuntimeError:
-        pass
-    await call.message.edit_text("Принято: 👍 Ок. Спасибо за отзыв!" if get_user(uid)["lang"]=="ru" else "Qabul qilindi: 👍 Ok. Rahmat!")
-    await call.answer()
-
-@dp.callback_query(F.data == "fb:bad")
-async def cb_fb_bad(call: CallbackQuery):
-    uid = call.from_user.id
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_sheets_append_feedback_async(
-            uid,
-            call.from_user.username or "",
-            call.from_user.first_name or "",
-            call.from_user.last_name or "",
-            "not_ok",
-            ""
-        ))
-        loop.create_task(_sheets_append_metric_async(uid, "feedback", "not_ok"))
-    except RuntimeError:
-        pass
-    await call.message.edit_text("Зафиксировал: 👎 Не ок. Спасибо!" if get_user(uid)["lang"]=="ru" else "Yozib oldim: 👎 Not ok. Rahmat!")
-    await call.answer()
-
-@dp.callback_query(F.data == "fb:comment")
-async def cb_fb_comment(call: CallbackQuery):
-    uid = call.from_user.id
-    FEEDBACK_PENDING.add(uid)
-    txt = (
-        "Напишите короткий комментарий одним сообщением (или /cancel):"
-        if get_user(uid)["lang"] == "ru"
-        else "Bitta xabar bilan qisqa izoh yozing (yoki /cancel):"
-    )
-    await call.message.edit_text(txt)
-    await call.answer()
-
-# ================== АДМИН: активация подписки =================
-@dp.message(Command("grant_creative"))
-async def cmd_grant_creative(message: Message):
-    if str(message.from_user.id) != str(ADMIN_CHAT_ID):
-        return await message.answer("Команда недоступна.")
-    parts = message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await message.answer("Использование: /grant_creative <tg_id>")
-    target_id = int(parts[1]); u = get_user(target_id)
-    u["plan"] = "creative"
-    u["paid_until"] = datetime.utcnow() + timedelta(days=TARIFF["creative"]["duration_days"]); save_users()
-    await message.answer(f"✅ Активирован «Creative» для {target_id} до {u['paid_until'].isoformat()}")
-    try:
-        if bot:
-            await bot.send_message(target_id, "✅ Подписка «Creative» активирована. Приятного использования!")
+    if m in ("gpt", "legal"):
+        set_mode(call.from_user.id, m)
+        lang = u.get("lang","ru")
+        label = "GPT-помощник" if (m == "gpt" and lang == "ru") else ("GPT-yordamchi" if m == "gpt" else ("Юридический консультант" if lang=="ru" else "Yuridik maslahatchi"))
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_sheets_update_user_row_async(
-                target_id, "", "", "", get_user(target_id).get("lang","ru"), "creative", u["paid_until"]
-            ))
-            loop.create_task(_sheets_append_metric_async(target_id, "grant", "creative"))
-        except RuntimeError:
+            await call.message.edit_reply_markup(reply_markup=mode_kb(lang, current=m))
+        except Exception:
             pass
-    except Exception:
-        logging.warning("Notify user failed")
+        await call.answer(("Режим: " + label) if lang == "ru" else ("Rejim: " + label))
 
-# ================== QUEUE + CACHE ДЛЯ Q/A ==================
-# --- Очередь задач и оценки ETA
-WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))   # кол-во воркеров
-QUEUE_NOTICE_THRESHOLD = int(os.getenv("QUEUE_NOTICE_THRESHOLD", "3"))
-ETA_MIN_SEC = int(os.getenv("ETA_MIN_SEC", "5"))
-ETA_MAX_SEC = int(os.getenv("ETA_MAX_SEC", "120"))
+# ================== ПРАВИЛА ДЛЯ ЮРИДИЧЕСКОГО РАЗДЕЛА ==================
+# Жёсткая политика:
+# 1) Только нормы права РУз, проверяемые на lex.uz
+# 2) Если нет подтверждённой нормы — отвечаем отказом без догадок
+# 3) Ссылки только на https://lex.uz/ и прямые статьи/документы
+# 4) Кратко и по делу, цитаты с номером статьи/пункта, ссылкой
+LEGAL_RULES_RU = (
+    "⚖️ Правила юридического раздела:\n"
+    "• Отвечаю только в рамках законодательства Республики Узбекистан и только по проверенным нормам с lex.uz.\n"
+    "• Если не нахожу точную норму — честно сообщаю, что ответа нет, без домыслов.\n"
+    "• Даю короткие выдержки с указанием статьи/пункта и прямой ссылкой на lex.uz.\n"
+    "• Это не индивидуальная юридическая помощь и не замена адвокату."
+)
+LEGAL_RULES_UZ = (
+    "⚖️ Yuridik bo‘lim qoidalari:\n"
+    "• Faqat O‘zbekiston Respublikasi qonunchiligiga tayangan holda va faqat lex.uz manbalari bilan javob beraman.\n"
+    "• Aniq norma topilmasa — taxminsiz, halol javob: hozircha topilmadi.\n"
+    "• Qisqa iqtiboslar: modda/band raqami va to‘g‘ridan-to‘g‘ri lex.uz havolasi bilan.\n"
+    "• Bu shaxsiy yuridik yordam emas, advokat o‘rnini bosa olmaydi."
+)
 
-SAVOL_QUEUE: asyncio.Queue = asyncio.Queue()
-_avg_service_sec: float | None = None
-_service_alpha = float(os.getenv("SERVICE_ALPHA", "0.2"))
+@dp.message(Command("legal"))
+async def cmd_legal(message: Message):
+    u = get_user(message.from_user.id)
+    set_mode(message.from_user.id, "legal")
+    txt = LEGAL_RULES_RU if u.get("lang","ru") == "ru" else LEGAL_RULES_UZ
+    await message.answer(("Режим переключён: ⚖️ Юридический консультант.\n\n" + txt)
+                         if u.get("lang","ru") == "ru"
+                         else ("Rejim almashtirildi: ⚖️ Yuridik maslahatchi.\n\n" + txt))
 
-# --- Кэш Q/A (точное совпадение вопроса)
-QA_CACHE: dict[str, dict] = {}
-QA_CACHE_MAX = int(os.getenv("QA_CACHE_MAX", "1000"))
-QA_CACHE_TTL = int(os.getenv("QA_CACHE_TTL", "86400"))  # 24h
+# ================== ТОН/ПРОМПТЫ ДЛЯ LEGAL ==================
+LEGAL_SYSTEM_PROMPT = (
+    "Ты — юридический консультант по законодательству Республики Узбекистан. "
+    "Отвечай строго на основе норм права РУз и ТОЛЬКО при наличии подтверждения на lex.uz. "
+    "Формат ответа: 1) краткий вывод; 2) выдержки с указанием статьи/пункта; 3) ССЫЛКИ на lex.uz. "
+    "Запрещены ссылки на иные сайты. Если подтверждающей нормы нет — напиши, что точной нормы не найдено, и предложи обратиться к юристу."
+)
 
-def _qa_norm(q: str) -> str:
-    return re.sub(r"\s+", " ", q.strip().lower())
+# Разрешаем ссылки только в LEGAL-режиме
+def cleanup_text(text: str, allow_links: bool = False) -> str:
+    s = _sanitize_cutoff(text or "")
+    if allow_links:
+        # только уберём хвостовые «источники: ...» от моделей
+        return SOURCES_BLOCK_PAT.sub("", s).strip()
+    return strip_links_and_cleanup(s)
 
-def qa_cache_get(q: str) -> Optional[str]:
-    k = _qa_norm(q)
-    it = QA_CACHE.get(k)
-    if not it:
+# Поиск только по lex.uz через Tavily
+async def legal_search_lex(query: str, max_results: int = 5) -> Optional[dict]:
+    if not TAVILY_API_KEY:
         return None
-    if time.time() - it["ts"] > QA_CACHE_TTL:
-        QA_CACHE.pop(k, None); return None
-    return it["answer"]
-
-def qa_cache_set(q: str, a: str):
-    k = _qa_norm(q)
-    if len(QA_CACHE) >= QA_CACHE_MAX:
-        oldest = min(QA_CACHE, key=lambda x: QA_CACHE[x]["ts"])
-        QA_CACHE.pop(oldest, None)
-    QA_CACHE[k] = {"ts": time.time(), "answer": a}
-
-def _eta_seconds(pos: int) -> int:
-    if pos <= 1:
-        return ETA_MIN_SEC
-    avg = _avg_service_sec if (_avg_service_sec and _avg_service_sec > 0.1) else 6.0
-    est = int(((pos - 1) * avg) / max(1, WORKER_CONCURRENCY))
-    return max(ETA_MIN_SEC, min(ETA_MAX_SEC, est))
-
-def _update_avg_service(elapsed: float):
-    global _avg_service_sec
-    if _avg_service_sec is None:
-        _avg_service_sec = float(elapsed)
-    else:
-        _avg_service_sec = _service_alpha * float(elapsed) + (1 - _service_alpha) * _avg_service_sec
-
-class SavolTask(dict):
-    """ chat_id, uid, text, lang, topic_hint, use_live """
-    pass
-
-async def _process_task(task: SavolTask):
-    uid = task["uid"]; chat_id = task["chat_id"]; text = task["text"]
-    lang = task["lang"]; topic_hint = task["topic_hint"]; use_live = task["use_live"]
-    t0 = time.time()
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "advanced",
+        "max_results": max_results,
+        "include_answer": False,
+        "include_domains": ["lex.uz"],
+    }
+    async def _do():
+        return await client_http.post("https://api.tavily.com/search", json=payload)
     try:
-        # 1) Кэш Q/A
-        cached = qa_cache_get(text)
-        if cached:
-            try:
-                await bot.send_message(chat_id, f"(из базы) {cached}")
-            except Exception:
-                pass
-            append_history(uid, "assistant", cached)
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(_sheets_append_history_async(uid, "assistant", cached))
-                loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(cached)), notes="assistant_len_cached"))
-            except RuntimeError:
-                pass
-            return
-
-        # 2) GPT запрос (live или обычный)
-        async def _get_answer():
-            return await (answer_with_live_search(text, topic_hint, uid) if use_live else ask_gpt(text, topic_hint, uid))
-
-        reply = await asyncio.wait_for(_get_answer(), timeout=REPLY_TIMEOUT_SEC)
-        reply = strip_links_and_cleanup(reply)
-
-        # 3) Верификация по live-источникам (при необходимости)
-        if VERIFY_DYNAMIC and _looks_dynamic(text, reply):
-            try:
-                reply_v = await asyncio.wait_for(verify_with_live_sources(text, reply, topic_hint, uid), timeout=VERIFY_TIMEOUT_SEC)
-                if reply_v and reply_v.strip():
-                    reply = reply_v
-            except Exception:
-                pass
-
-        # 4) Отправка пользователю
-        try:
-            await bot.send_message(chat_id, reply)
-        except Exception:
-            pass
-
-        # 5) Кэширование
-        qa_cache_set(text, reply)
-
-        # 6) История и метрики
-        append_history(uid, "user", text)      # как было раньше (после ответа)
-        append_history(uid, "assistant", reply)
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
-            loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(reply)), notes="assistant_len"))
-        except RuntimeError:
-            pass
-
-    except asyncio.TimeoutError:
-        err_txt = _friendly_error_text(asyncio.TimeoutError(), lang)
-        try:
-            await bot.send_message(chat_id, err_txt)
-        except Exception:
-            pass
-        try:
-            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "timeout"))
-        except RuntimeError:
-            pass
+        r = await _retry(lambda: _do(), attempts=2)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        logging.exception("worker _process_task fatal")
-        err_txt = _friendly_error_text(e, lang)
-        try:
-            await bot.send_message(chat_id, err_txt)
-        except Exception:
-            pass
-        try:
-            asyncio.get_running_loop().create_task(_sheets_append_metric_async(uid, "error", "generic", notes=str(e)))
-        except RuntimeError:
-            pass
-    finally:
-        _update_avg_service(time.time() - t0)
+        logging.warning("legal search failed: %s", e)
+        return None
 
-async def _queue_worker(name: str):
-    while True:
-        task: SavolTask = await SAVOL_QUEUE.get()
-        try:
-            await _process_task(task)
-        finally:
-            SAVOL_QUEUE.task_done()
+def _format_lex_results(data: dict, limit: int = 5) -> list[dict]:
+    items = []
+    for it in (data.get("results") or [])[:limit]:
+        url = it.get("url") or ""
+        if "lex.uz" not in url:
+            continue
+        items.append({
+            "title": (it.get("title") or "").strip(),
+            "snippet": (it.get("content") or "").strip(),
+            "url": url
+        })
+    return items
 
-# ================== ОБРАБОТЧИК ВОПРОСОВ =================
+async def answer_legal(user_text: str, user_id: int) -> str:
+    # 1) Ищем на lex.uz
+    data = await legal_search_lex(user_text, max_results=6)
+    sources = _format_lex_results(data or {}, limit=5) if data else []
+    if not sources:
+        # Честный отказ — без домыслов
+        return ("Не нашёл подтверждённой нормы на lex.uz по вашему вопросу. "
+                "Советую уточнить формулировку (какой закон/сфера) или обратиться к юристу.")
+    # 2) Собираем компактный бриф для модели
+    brief = []
+    for s in sources:
+        t = (s["title"] or "")[:120]
+        sn = (s["snippet"] or "")[:600]
+        brief.append(f"- {t}\n{sn}\n{ s['url'] }")
+    user_aug = (
+        f"ВОПРОС:\n{user_text}\n\n"
+        f"НАЙДЕННЫЕ ДОКУМЕНТЫ (lex.uz):\n" + "\n\n".join(brief)
+    )
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.1,
+        "messages": build_messages(user_id, LEGAL_SYSTEM_PROMPT, user_aug),
+    }
+    async def _do():
+        return await client_openai.post("/chat/completions", headers=headers, json=payload)
+    try:
+        async with _model_sem:
+            r = await _retry(lambda: _do(), attempts=3)
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        # В LEGAL-режиме ссылки разрешены и обязательны
+        return cleanup_text(text, allow_links=True)
+    except Exception as e:
+        logging.exception("answer_legal failed")
+        return "⚠️ Не удалось сформировать юридический ответ. Попробуйте переформулировать вопрос."
+
+# ================== ОБНОВЛЁННЫЙ ОБРАБОТЧИК ТЕКСТА (ЗАМЕНИ СТАРЫЙ) ==================
 @dp.message(F.text)
 async def handle_text(message: Message):
     text = (message.text or "").strip()
@@ -1251,19 +1182,15 @@ async def handle_text(message: Message):
     if is_uzbek(text):
         u["lang"] = "uz"; save_users()
 
-    # --- перехват комментария по фидбэку ---
+    # Перехват комментария по фидбэку
     if uid in FEEDBACK_PENDING:
         FEEDBACK_PENDING.discard(uid)
         comment_text = text
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(_sheets_append_feedback_async(
-                uid,
-                message.from_user.username or "",
-                message.from_user.first_name or "",
-                message.from_user.last_name or "",
-                "comment_only",
-                comment_text
+                uid, message.from_user.username or "", message.from_user.first_name or "",
+                message.from_user.last_name or "", "comment_only", comment_text
             ))
             loop.create_task(_sheets_append_metric_async(uid, "feedback", "comment"))
         except RuntimeError:
@@ -1273,13 +1200,13 @@ async def handle_text(message: Message):
         append_history(uid, "user", comment_text)
         append_history(uid, "assistant", ok_txt)
         try:
-            loop.create_task(_sheets_append_history_async(uid, "user", comment_text))
-            loop.create_task(_sheets_append_history_async(uid, "assistant", ok_txt))
+            asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "user", comment_text))
+            asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "assistant", ok_txt))
         except RuntimeError:
             pass
         return
 
-    # Политика
+    # Политика запрещённого контента
     low = text.lower()
     if any(re.search(rx, low) for rx in ILLEGAL_PATTERNS):
         deny = DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU
@@ -1293,7 +1220,7 @@ async def handle_text(message: Message):
             pass
         return
 
-    # Проверка подписки / триала (если не в белом списке)
+    # Paywall (если не в белом списке)
     if (not is_whitelisted(uid)) and (not has_active_sub(u)):
         txt = "💳 Бесплатный период закончился. Подключите ⭐ Creative, чтобы продолжить:"
         await message.answer(txt, reply_markup=pay_kb())
@@ -1306,7 +1233,7 @@ async def handle_text(message: Message):
             pass
         return
 
-    # Сохраним идентификацию в Users-реестр (username/имя)
+    # Запишем идентификацию + историю/метрики
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_sheets_update_user_row_async(
@@ -1323,10 +1250,40 @@ async def handle_text(message: Message):
     except RuntimeError:
         pass
 
-    # === ОЧЕРЕДЬ: ставим задачу и отвечаем статусом
-    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
-    use_live = (FORCE_LIVE or is_time_sensitive(text))
+    # Роутинг по режимам
+    cur_mode = get_mode(uid)
 
+    # Очередь + ACK (общая логика)
+    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
+    use_live = (cur_mode == "legal") or FORCE_LIVE or is_time_sensitive(text)
+
+    # Пушим задачу в очередь, но легальный режим выполняем напрямую (чтобы не задерживать)
+    if cur_mode == "legal":
+        # Жёсткая логика: только lex.uz. Без очереди, чтобы не смешивать с кэшем GPT.
+        try:
+            reply = await asyncio.wait_for(answer_legal(text, uid), timeout=REPLY_TIMEOUT_SEC)
+            reply = cleanup_text(reply, allow_links=True)
+        except asyncio.TimeoutError:
+            reply = _friendly_error_text(asyncio.TimeoutError(), u.get("lang","ru"))
+        except Exception as e:
+            logging.exception("legal reply fatal")
+            reply = _friendly_error_text(e, u.get("lang","ru"))
+
+        try:
+            await message.answer(reply)
+        except Exception:
+            pass
+
+        append_history(uid, "assistant", reply)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
+            loop.create_task(_sheets_append_metric_async(uid, "msg", value=str(len(reply)), notes="assistant_len_legal"))
+        except RuntimeError:
+            pass
+        return
+
+    # Иначе — GPT режим с очередью (как раньше), но с верификацией
     task = SavolTask({
         "chat_id": message.chat.id,
         "uid": uid,
@@ -1354,90 +1311,7 @@ async def handle_text(message: Message):
 
     append_history(uid, "assistant", ack)
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_sheets_append_history_async(uid, "assistant", ack))
+        asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "assistant", ack))
     except RuntimeError:
         pass
 
-    return
-
-# ================== Lifespan (инициализация/закрытие) =================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    load_users()
-    load_history()
-    _init_sheets()
-
-    HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "0") == "1"
-    try:
-        import h2  # noqa: F401
-        _h2_ok = True
-    except Exception:
-        _h2_ok = False
-    use_http2 = HTTP2_ENABLED and _h2_ok
-
-    global client_openai, client_http
-    client_openai = httpx.AsyncClient(base_url=OPENAI_API_BASE, timeout=HTTPX_TIMEOUT, http2=use_http2)
-    client_http = httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=use_http2)
-
-    # Вебхук на старте
-    if TELEGRAM_TOKEN and WEBHOOK_URL and client_http:
-        try:
-            resp = await client_http.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-                json={
-                    "url": WEBHOOK_URL,
-                    "secret_token": WEBHOOK_SECRET,
-                    "drop_pending_updates": True,
-                    "max_connections": 80,
-                    "allowed_updates": ["message", "callback_query"],
-                },
-            )
-            logging.info("setWebhook: %s %s", resp.status_code, resp.text)
-        except Exception:
-            logging.exception("Failed to set webhook")
-
-    # === ОЧЕРЕДЬ: старт воркеров ===
-    worker_tasks = []
-    try:
-        for i in range(WORKER_CONCURRENCY):
-            worker_tasks.append(asyncio.create_task(_queue_worker(f"w{i+1}")))
-        logging.info("Queue workers started: %s", WORKER_CONCURRENCY)
-    except Exception:
-        logging.exception("Failed to start workers")
-
-    try:
-        yield
-    finally:
-        try:
-            for t in worker_tasks:
-                t.cancel()
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
-        except Exception:
-            pass
-        try:
-            if client_openai:
-                await client_openai.aclose()
-        except Exception:
-            pass
-        try:
-            if client_http:
-                await client_http.aclose()
-        except Exception:
-            pass
-
-app = FastAPI(lifespan=lifespan)
-
-# ================== WEBHOOK =================
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        return {"ok": False, "error": "bad secret"}
-    data = await request.json()
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    return {"ok": True}
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
