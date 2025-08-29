@@ -1026,6 +1026,65 @@ async def cmd_about(message: Message):
         )
     await safe_answer(message, txt, reply_markup=mode_kb(u.get("lang","ru"), current=get_mode(message.from_user.id)))
 
+# ===== FEEDBACK: callbacks =====
+@dp.callback_query(F.data.startswith("fb:"))
+async def cb_feedback(call: CallbackQuery):
+    uid = call.from_user.id
+    u = get_user(uid)
+    lang = u.get("lang", "ru")
+    data = call.data.split(":", 1)[1]
+
+    # Уберём клавиатуру у сообщения с ответом
+    await safe_edit_reply_markup(call.message, reply_markup=None)
+
+    if data == "ok":
+        txt = "Спасибо за отзыв! 🙌" if lang == "ru" else "Fikringiz uchun rahmat! 🙌"
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_feedback_async(
+                uid, call.from_user.username or "", call.from_user.first_name or "",
+                call.from_user.last_name or "", "ok", ""
+            ))
+            loop.create_task(_sheets_append_metric_async(uid, "feedback", "ok"))
+        except RuntimeError:
+            pass
+        await call.answer("OK")  # всплывашка
+        await safe_answer(call.message, txt)
+        append_history(uid, "assistant", txt)
+        return
+
+    if data == "bad":
+        txt = ("Понял. Напишите пару слов, что было не так — улучшим. ✍️"
+               if lang == "ru" else
+               "Tushundim. Nima yoqmadi? Bir-ikki so‘z yozing, yaxshilaymiz. ✍️")
+        FEEDBACK_PENDING.add(uid)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_feedback_async(
+                uid, call.from_user.username or "", call.from_user.first_name or "",
+                call.from_user.last_name or "", "bad", ""
+            ))
+            loop.create_task(_sheets_append_metric_async(uid, "feedback", "bad"))
+        except RuntimeError:
+            pass
+        await call.answer("Спасибо!")  # всплывашка
+        await safe_answer(call.message, txt)
+        append_history(uid, "assistant", txt)
+        return
+
+    if data == "comment":
+        FEEDBACK_PENDING.add(uid)
+        txt = "Напишите ваш комментарий ниже. ✍️" if lang == "ru" else "Izohingizni yozing. ✍️"
+        await call.answer("Ок")
+        await safe_answer(call.message, txt)
+        append_history(uid, "assistant", txt)
+        return
+
+    if data == "close":
+        await call.answer("Закрыто" if lang == "ru" else "Yopildi")
+        # Ничего больше не делаем
+        return
+
 # ================== РЕЖИМЫ: GPT / LEGAL ==================
 def get_mode(user_id: int) -> str:
     u = get_user(user_id)
@@ -1085,6 +1144,26 @@ async def handle_text(message: Message):
     text = (message.text or "").strip()
     uid = message.from_user.id
     u = get_user(uid)
+    import re
+
+# ---- Smalltalk (дружелюбные ответы)
+if _SMALLTALK_RX.search(text):
+    reply = _smalltalk_reply(u.get("lang", "ru"))
+    await safe_answer(message, reply, reply_markup=feedback_kb())
+    append_history(uid, "assistant", reply)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
+    except RuntimeError:
+        pass
+    return
+
+_SMALLTALK_RX = re.compile(r"^(привет|салам|салом|hi|hello|здравствуй|ассалому\s*алайкум)\b", re.I)
+
+def _smalltalk_reply(lang: str) -> str:
+    if lang == "uz":
+        return "Salom! Qalaysiz? Bugun nimaga yordam bera olay? 🙂"
+    return "Привет! Как дела? Чем помочь сегодня? 🙂"
 
     # Язык
     if is_uzbek(text):
@@ -1215,6 +1294,18 @@ async def handle_text(message: Message):
     try:
         asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "assistant", ack))
     except RuntimeError:
+        pass
+
+from aiogram.enums import ChatAction
+
+async def _pulse_typing(chat_id: int, stop_event: asyncio.Event):
+    """Периодически шлём 'typing', пока не остановят."""
+    try:
+        while not stop_event.is_set():
+            if bot:
+                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(4.0)
+    except Exception:
         pass
 
 async def typing_status_loop(chat_id: int, lang: str, stop: asyncio.Event):
