@@ -6,6 +6,7 @@ import time
 import logging
 import asyncio
 import random
+from aiogram.enums import ChatAction
 from aiogram.types.error_event import ErrorEvent
 from dataclasses import dataclass
 from datetime import datetime, timedelta
