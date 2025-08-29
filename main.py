@@ -10,6 +10,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
 from gspread.utils import rowcol_to_a1
+from aiogram.exceptions import TelegramBadRequest
 
 import httpx
 from httpx import HTTPError, HTTPStatusError
@@ -23,6 +24,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ================== LOGS ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s:%(lineno)d — %(message)s"
+)
 logging.basicConfig(level=logging.INFO)
 
 # ================== ENV ===================
@@ -914,14 +919,15 @@ def topic_kb(lang="ru", current=None):
     rows.append([InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="topic:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def mode_kb(current: str = "gpt"):
-    gpt_label = "✅ 👤 Повседневный (GPT)" if current == "gpt" else "👤 Повседневный (GPT)"
-    legal_label = "✅ ⚖️ Юридический (lex.uz)" if current == "legal" else "⚖️ Юридический (lex.uz)"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=gpt_label, callback_data="mode:gpt")],
-        [InlineKeyboardButton(text=legal_label, callback_data="mode:legal")],
-        [InlineKeyboardButton(text="↩️ Закрыть", callback_data="mode:close")],
-    ])
+def mode_kb(lang="ru", current=None):
+    gpt = "🧰 GPT-помощник" if lang == "ru" else "🧰 GPT-yordamchi"
+    legal = "⚖️ Юридический консультант" if lang == "ru" else "⚖️ Yuridik maslahatchi"
+    rows = [
+        [InlineKeyboardButton(text=("✅ " + gpt) if current == "gpt" else gpt, callback_data="mode:gpt")],
+        [InlineKeyboardButton(text=("✅ " + legal) if current == "legal" else legal, callback_data="mode:legal")],
+        [InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="mode:close")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 LEGAL_RULES_RU = (
     "⚖️ Раздел «Юридические вопросы» — правила:\n"
@@ -942,6 +948,40 @@ LEGAL_RULES_UZ = (
     "Rejimni /mode orqali almashtiring."
 )
 
+from aiogram.exceptions import TelegramBadRequest
+
+async def safe_answer(msg, text: str, **kwargs):
+    try:
+        return await msg.answer(text, **kwargs)
+    except TelegramBadRequest as e:
+        logging.warning("answer failed: %s", e)
+    except Exception:
+        logging.exception("answer fatal")
+
+async def safe_edit_text(msg, text: str, **kwargs):
+    try:
+        return await msg.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        logging.warning("edit_text failed: %s", e)
+    except Exception:
+        logging.exception("edit_text fatal")
+
+async def safe_edit_reply_markup(msg, **kwargs):
+    try:
+        return await msg.edit_reply_markup(**kwargs)
+    except TelegramBadRequest as e:
+        logging.warning("edit_reply_markup failed: %s", e)
+    except Exception:
+        logging.exception("edit_reply_markup fatal")
+
+async def safe_delete(msg):
+    try:
+        return await msg.delete()
+    except TelegramBadRequest as e:
+        logging.warning("delete failed: %s", e)
+    except Exception:
+        logging.exception("delete fatal")
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     u = get_user(message.from_user.id)
@@ -958,6 +998,21 @@ async def cmd_start(message: Message):
     try:
         asyncio.get_running_loop().create_task(_sheets_append_history_async(message.from_user.id, "assistant", hello))
     except RuntimeError:
+        pass
+
+# где-нибудь рядом с инициализацией dp
+@dp.errors()
+async def on_error(event, exception):
+    # event может быть UpdateEvent, MessageEvent и т.п.
+    logging.exception("Unhandled error: %s | event=%s", exception, repr(event))
+    try:
+        obj = getattr(event, "update", None) or getattr(event, "event", None)
+        chat_id = None
+        if obj and hasattr(obj, "message") and obj.message and hasattr(obj.message, "chat"):
+            chat_id = obj.message.chat.id
+        if chat_id and bot:
+            await bot.send_message(chat_id, "⚠️ Внутренняя ошибка обработчика. Попробуйте повторить запрос.")
+    except Exception:
         pass
 
 @dp.message(Command("help"))
@@ -982,28 +1037,31 @@ async def cmd_help(message: Message):
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
     u = get_user(message.from_user.id)
-    txt = (
-        "🤖 SavolBot от TripleA — два режима:\n"
-        "1) 🧰 Помощник по повседневным вопросам (GPT): идеи, тексты, советы.\n"
-        "2) ⚖️ Юридический консультант: только по законам РУз, с прямыми ссылками на lex.uz, без домыслов.\n\n"
-        "Команды:\n"
-        "/mode — выбрать режим\n"
-        "/tariffs — тариф\n"
-        "/myplan — мой план\n"
-        "/topics — темы (для GPT)\n"
-        "/new — очистить контекст"
-        if u["lang"] == "ru" else
-        "🤖 SavolBot (TripleA) — ikki rejim:\n"
-        "1) 🧰 Kundalik yordamchi (GPT): g‘oyalar, matnlar, maslahatlar.\n"
-        "2) ⚖️ Yuridik maslahatchi: faqat O‘zR qonunlari bo‘yicha, lex.uz havolalari bilan, taxminsiz.\n\n"
-        "Buyruqlar:\n"
-        "/mode — rejim tanlash\n"
-        "/tariffs — tarif\n"
-        "/myplan — reja\n"
-        "/topics — mavzular (GPT uchun)\n"
-        "/new — kontekstni tozalash"
-    )
-    await message.answer(txt)
+    if u.get("lang", "ru") == "ru":
+        txt = (
+            "🤖 SavolBot от TripleA — два режима:\n"
+            "1) 🧰 Помощник по повседневным вопросам (GPT): идеи, тексты, советы.\n"
+            "2) ⚖️ Юридический консультант: только по законам РУз, с прямыми ссылками на lex.uz, без домыслов.\n\n"
+            "Команды:\n"
+            "/mode — выбрать режим\n"
+            "/tariffs — тариф\n"
+            "/myplan — мой план\n"
+            "/topics — темы (для GPT)\n"
+            "/new — очистить контекст"
+        )
+    else:
+        txt = (
+            "🤖 SavolBot (TripleA) — ikki rejim:\n"
+            "1) 🧰 Kundalik yordamchi (GPT): g‘oyalar, matnlar, maslahatlar.\n"
+            "2) ⚖️ Yuridik maslahatchi: faqat O‘zR qonunlari bo‘yicha, lex.uz havolalari bilan, taxminsiz.\n\n"
+            "Buyruqlar:\n"
+            "/mode — rejim tanlash\n"
+            "/tariffs — tarif\n"
+            "/myplan — reja\n"
+            "/topics — mavzular (GPT uchun)\n"
+            "/new — kontekstni tozalash"
+        )
+    await safe_answer(message, txt, reply_markup=mode_kb(u.get("lang","ru"), current=get_mode(message.from_user.id)))
 
 # ================== РЕЖИМЫ: GPT / LEGAL ==================
 # У пользователя появится поле mode: "gpt" (по умолчанию) или "legal"
@@ -1022,36 +1080,32 @@ def set_mode(user_id: int, mode: str):
 def mode_kb(lang="ru", current=None):
     gpt = "🧰 GPT-помощник" if lang == "ru" else "🧰 GPT-yordamchi"
     legal = "⚖️ Юридический консультант" if lang == "ru" else "⚖️ Yuridik maslahatchi"
-    rows = [[InlineKeyboardButton(text=("✅ " + gpt) if current == "gpt" else gpt, callback_data="mode:gpt")],
-            [InlineKeyboardButton(text=("✅ " + legal) if current == "legal" else legal, callback_data="mode:legal")],
-            [InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="mode:close")]]
+    rows = [
+        [InlineKeyboardButton(text=("✅ " + gpt) if current == "gpt" else gpt, callback_data="mode:gpt")],
+        [InlineKeyboardButton(text=("✅ " + legal) if current == "legal" else legal, callback_data="mode:legal")],
+        [InlineKeyboardButton(text="↩️ Закрыть / Yopish", callback_data="mode:close")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @dp.message(Command("mode"))
 async def cmd_mode(message: Message):
     u = get_user(message.from_user.id)
-    await message.answer("Выберите режим:" if u["lang"] == "ru" else "Rejimni tanlang:", 
-                         reply_markup=mode_kb(u.get("lang","ru"), current=get_mode(message.from_user.id)))
+    head = "Выберите режим:" if u.get("lang","ru") == "ru" else "Rejimni tanlang:"
+    await safe_answer(message, head, reply_markup=mode_kb(u.get("lang","ru"), current=get_mode(message.from_user.id)))
 
 @dp.callback_query(F.data.startswith("mode:"))
 async def cb_mode(call: CallbackQuery):
     u = get_user(call.from_user.id)
     _, m = call.data.split(":", 1)
     if m == "close":
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
+        await safe_delete(call.message)
         return await call.answer("OK")
     if m in ("gpt", "legal"):
         set_mode(call.from_user.id, m)
         lang = u.get("lang","ru")
-        label = "GPT-помощник" if (m == "gpt" and lang == "ru") else ("GPT-yordamchi" if m == "gpt" else ("Юридический консультант" if lang=="ru" else "Yuridik maslahatchi"))
-        try:
-            await call.message.edit_reply_markup(reply_markup=mode_kb(lang, current=m))
-        except Exception:
-            pass
-        await call.answer(("Режим: " + label) if lang == "ru" else ("Rejim: " + label))
+        label = ("GPT-помощник" if lang=="ru" else "GPT-yordamchi") if m=="gpt" else ("Юридический консультант" if lang=="ru" else "Yuridik maslahatchi")
+        await safe_edit_reply_markup(call.message, reply_markup=mode_kb(lang, current=m))
+        return await call.answer(("Режим: " + label) if lang == "ru" else ("Rejim: " + label))
 
 # ================== ПРАВИЛА ДЛЯ ЮРИДИЧЕСКОГО РАЗДЕЛА ==================
 # Жёсткая политика:
@@ -1078,10 +1132,9 @@ LEGAL_RULES_UZ = (
 async def cmd_legal(message: Message):
     u = get_user(message.from_user.id)
     set_mode(message.from_user.id, "legal")
-    txt = LEGAL_RULES_RU if u.get("lang","ru") == "ru" else LEGAL_RULES_UZ
-    await message.answer(("Режим переключён: ⚖️ Юридический консультант.\n\n" + txt)
-                         if u.get("lang","ru") == "ru"
-                         else ("Rejim almashtirildi: ⚖️ Yuridik maslahatchi.\n\n" + txt))
+    txt_rules = LEGAL_RULES_RU if u.get("lang","ru") == "ru" else LEGAL_RULES_UZ
+    head = "Режим переключён: ⚖️ Юридический консультант.\n\n" if u.get("lang","ru")=="ru" else "Rejim almashtirildi: ⚖️ Yuridik maslahatchi.\n\n"
+    await safe_answer(message, head + txt_rules, reply_markup=mode_kb(u.get("lang","ru"), current="legal"))
 
 # ================== ТОН/ПРОМПТЫ ДЛЯ LEGAL ==================
 LEGAL_SYSTEM_PROMPT = (
@@ -1102,6 +1155,10 @@ def cleanup_text(text: str, allow_links: bool = False) -> str:
 # Поиск только по lex.uz через Tavily
 async def legal_search_lex(query: str, max_results: int = 5) -> Optional[dict]:
     if not TAVILY_API_KEY:
+        logging.warning("legal_search_lex: no TAVILY_API_KEY")
+        return None
+    if client_http is None:
+        logging.warning("legal_search_lex: client_http is None")
         return None
     payload = {
         "api_key": TAVILY_API_KEY,
@@ -1135,13 +1192,12 @@ def _format_lex_results(data: dict, limit: int = 5) -> list[dict]:
     return items
 
 async def answer_legal(user_text: str, user_id: int) -> str:
-    # 1) Ищем на lex.uz
     data = await legal_search_lex(user_text, max_results=6)
     sources = _format_lex_results(data or {}, limit=5) if data else []
     if not sources:
-        # Честный отказ — без домыслов
         return ("Не нашёл подтверждённой нормы на lex.uz по вашему вопросу. "
-                "Советую уточнить формулировку (какой закон/сфера) или обратиться к юристу.")
+                "Уточните формулировку (закон/сфера) или обратитесь к юристу.")
+    # ... остальное без изменений
     # 2) Собираем компактный бриф для модели
     brief = []
     for s in sources:
@@ -1210,7 +1266,7 @@ async def handle_text(message: Message):
     low = text.lower()
     if any(re.search(rx, low) for rx in ILLEGAL_PATTERNS):
         deny = DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU
-        await message.answer(deny)
+        await safe_answer(message, deny)
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(_sheets_append_history_async(uid, "user", text))
@@ -1223,7 +1279,7 @@ async def handle_text(message: Message):
     # Paywall (если не в белом списке)
     if (not is_whitelisted(uid)) and (not has_active_sub(u)):
         txt = "💳 Бесплатный период закончился. Подключите ⭐ Creative, чтобы продолжить:"
-        await message.answer(txt, reply_markup=pay_kb())
+        await safe_answer(message, txt, reply_markup=pay_kb())
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(_sheets_append_history_async(uid, "user", text))
@@ -1268,9 +1324,8 @@ async def handle_text(message: Message):
         except Exception as e:
             logging.exception("legal reply fatal")
             reply = _friendly_error_text(e, u.get("lang","ru"))
-
         try:
-            await message.answer(reply)
+            await safe_answer(message, reply)
         except Exception:
             pass
 
@@ -1307,7 +1362,7 @@ async def handle_text(message: Message):
         else:
             ack = "🔎 Принял! Думаю над ответом — пришлю сообщение чуть позже."
 
-    await message.answer(ack)
+    await safe_answer(message, ack)
 
     append_history(uid, "assistant", ack)
     try:
