@@ -769,6 +769,15 @@ async def answer_legal(user_text: str, user_id: int) -> str:
         sn = (s["snippet"] or "")[:600]
         brief.append(f"- {t}\n{sn}\n{s['url']}")
     user_aug = f"ВОПРОС:\n{user_text}\n\nНАЙДЕННЫЕ ДОКУМЕНТЫ (lex.uz):\n" + "\n\n".join(brief)
+    import re as _re_check
+
+def _legal_answer_has_citations(ans: str) -> bool:
+    if not ans:
+        return False
+    has_link = "lex.uz" in ans
+    # грубая, но практичная проверка на "статья/модда/пункт/band"
+    has_article = bool(_re_check.search(r"(стат(ья|и)|модда|пункт|band)\s*\d+", ans, flags=_re_check.IGNORECASE))
+    return has_link and has_article
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
@@ -1114,6 +1123,8 @@ async def handle_text(message: Message):
             logging.exception("legal reply fatal")
             reply = _friendly_error_text(e, u.get("lang","ru"))
         await safe_answer(message, reply)
+        stop_event = asyncio.Event()
+        bg_task = asyncio.create_task(typing_status_loop(message.chat.id, u.get("lang","ru"), stop_event))
 
         append_history(uid, "assistant", reply)
         try:
@@ -1150,6 +1161,40 @@ async def handle_text(message: Message):
     try:
         asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "assistant", ack))
     except RuntimeError:
+        pass
+
+async def typing_status_loop(chat_id: int, lang: str, stop: asyncio.Event):
+    """
+    Каждые ~4 сек шлёт ChatAction.TYPING.
+    На 6-й и 15-й секундах — мягкие статус-сообщения (не спамим чаще).
+    """
+    first_hint_sent = False
+    second_hint_sent = False
+    t0 = time.monotonic()
+    try:
+        while not stop.is_set():
+            # индикатор "печатает..."
+            if bot:
+                try:
+                    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+                except Exception:
+                    pass
+
+            elapsed = time.monotonic() - t0
+            try:
+                if not first_hint_sent and elapsed > 6:
+                    txt = "…думаю и сверяю нормы на lex.uz" if lang != "uz" else "…o‘ylayapman va lex.uz bilan solishtiryapman"
+                    await bot.send_message(chat_id, txt)
+                    first_hint_sent = True
+                elif not second_hint_sent and elapsed > 15:
+                    txt = "…собираю подтверждения из первоисточников" if lang != "uz" else "…asosiy manbalardan tasdiqlarni yig‘ayapman"
+                    await bot.send_message(chat_id, txt)
+                    second_hint_sent = True
+            except Exception:
+                pass
+
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
         pass
 
 # ================== ОЧЕРЕДЬ/ВОРКЕРЫ =================
@@ -1223,6 +1268,9 @@ async def _queue_worker(name: str):
             logging.exception("worker %s: task failed", name)
         finally:
             SAVOL_QUEUE.task_done()
+            stop_event.set()
+            bg_task.cancel()
+
 
 # ================== LIFESPAN & APP =================
 @asynccontextmanager
@@ -1292,6 +1340,9 @@ async def lifespan(app: FastAPI):
                 await client_http.aclose()
         except Exception:
             pass
+            stop_event.set()
+            bg_task.cancel()
+
 
 # === FastAPI app (ВАЖНО: на верхнем уровне) ===
 app = FastAPI(lifespan=lifespan)
