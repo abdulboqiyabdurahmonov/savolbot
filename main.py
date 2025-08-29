@@ -1138,6 +1138,76 @@ async def cmd_legal(message: Message):
     head = "Режим переключён: ⚖️ Юридический консультант.\n\n" if u.get("lang","ru")=="ru" else "Rejim almashtirildi: ⚖️ Yuridik maslahatchi.\n\n"
     await safe_answer(message, head + txt_rules, reply_markup=mode_kb(u.get("lang","ru"), current="legal"))
 
+# === Импорты для этого блока ===
+import re
+import time
+import asyncio
+import logging
+from aiogram import F
+from aiogram.types import Message, CallbackQuery
+from aiogram.enums import ChatAction
+
+# === Безопасные дефолты для глобалок, чтобы не падать NameError ===
+WHITELIST_USERS = globals().get("WHITELIST_USERS", set())
+ILLEGAL_PATTERNS = globals().get("ILLEGAL_PATTERNS", [])
+DENY_TEXT_RU = globals().get("DENY_TEXT_RU", "Извините, по этому запросу я помочь не могу.")
+DENY_TEXT_UZ = globals().get("DENY_TEXT_UZ", "Kechirasiz, bu so‘rov bo‘yicha yordam bera olmayman.")
+REPLY_TIMEOUT_SEC = globals().get("REPLY_TIMEOUT_SEC", 45)
+QUEUE_NOTICE_THRESHOLD = globals().get("QUEUE_NOTICE_THRESHOLD", 3)
+
+# Эти функции/объекты ожидаются в проекте:
+# - bot, dp
+# - safe_answer, get_user, save_users, is_uzbek
+# - append_history, _sheets_* helpers, _friendly_error_text, strip_links_and_cleanup
+# - has_active_sub, pay_kb, get_mode, answer_legal, TOPICS, FORCE_LIVE, is_time_sensitive
+# - SavolTask, SAVOL_QUEUE, _eta_seconds, feedback_kb, FEEDBACK_PENDING
+
+# === Smalltalk: регэксп и ответ ===
+_SMALLTALK_RX = re.compile(
+    r"^(привет|салам|салом|hi|hello|здравствуй|ассалому\s*алайкум)\b",
+    re.IGNORECASE
+)
+
+def _smalltalk_reply(lang: str) -> str:
+    if lang == "uz":
+        return "Salom! Qalaysiz? Bugun nimaga yordam bera olay? 🙂"
+    return "Привет! Как дела? Чем помочь сегодня? 🙂"
+
+# === Фоновая индикация «печатает…» и мягкие статусы ===
+async def typing_status_loop(chat_id: int, lang: str, stop: asyncio.Event):
+    """
+    Каждые ~4 сек шлёт ChatAction.TYPING.
+    На 6-й и 15-й секундах — короткие статус-подсказки.
+    Останавливается, когда stop.set() вызван.
+    """
+    first_hint_sent = False
+    second_hint_sent = False
+    t0 = time.monotonic()
+    try:
+        while not stop.is_set():
+            # «печатает…»
+            try:
+                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            except Exception:
+                pass
+
+            elapsed = time.monotonic() - t0
+            try:
+                if not first_hint_sent and elapsed > 6:
+                    txt = "…думаю и сверяю нормы на lex.uz" if lang != "uz" else "…o‘ylayapman va lex.uz bilan solishtiryapman"
+                    await bot.send_message(chat_id, txt)
+                    first_hint_sent = True
+                elif not second_hint_sent and elapsed > 15:
+                    txt = "…собираю подтверждения из первоисточников" if lang != "uz" else "…asosiy manbalardan tasdiqlarni yig‘ayapman"
+                    await bot.send_message(chat_id, txt)
+                    second_hint_sent = True
+            except Exception:
+                pass
+
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
 # ================== ТЕКСТ-ХЕНДЛЕР ==================
 @dp.message(F.text)
 async def handle_text(message: Message):
@@ -1157,19 +1227,13 @@ async def handle_text(message: Message):
             pass
         return
 
-_SMALLTALK_RX = re.compile(r"^(привет|салам|салом|hi|hello|здравствуй|ассалому\s*алайкум)\b", re.I)
+    # ---- Язык
+    if 'is_uzbek' in globals() and callable(globals().get('is_uzbek')) and is_uzbek(text):
+        u["lang"] = "uz"
+        save_users()
 
-def _smalltalk_reply(lang: str) -> str:
-    if lang == "uz":
-        return "Salom! Qalaysiz? Bugun nimaga yordam bera olay? 🙂"
-    return "Привет! Как дела? Чем помочь сегодня? 🙂"
-
-    # Язык
-    if is_uzbek(text):
-        u["lang"] = "uz"; save_users()
-
-    # Фидбек-комментарий
-    if uid in FEEDBACK_PENDING:
+    # ---- Фидбек-комментарий (если ждём текст после кнопки)
+    if 'FEEDBACK_PENDING' in globals() and uid in FEEDBACK_PENDING:
         FEEDBACK_PENDING.discard(uid)
         comment_text = text
         try:
@@ -1181,33 +1245,44 @@ def _smalltalk_reply(lang: str) -> str:
             loop.create_task(_sheets_append_metric_async(uid, "feedback", "comment"))
         except RuntimeError:
             pass
-        ok_txt = "Спасибо! Ваш отзыв записан 🙌" if u["lang"]=="ru" else "Rahmat! Fikringiz yozib olindi 🙌"
+
+        ok_txt = "Спасибо! Ваш отзыв записан 🙌" if u.get("lang","ru")=="ru" else "Rahmat! Fikringiz yozib olindi 🙌"
         await message.answer(ok_txt)
         append_history(uid, "user", comment_text)
         append_history(uid, "assistant", ok_txt)
         try:
-            asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "user", comment_text))
-            asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "assistant", ok_txt))
-        except RuntimeError:
-            pass
-        return
-
-    # Политика запрещённого контента
-    low = text.lower()
-    if any(re.search(rx, low) for rx in ILLEGAL_PATTERNS):
-        deny = DENY_TEXT_UZ if u["lang"] == "uz" else DENY_TEXT_RU
-        await safe_answer(message, deny)
-        try:
             loop = asyncio.get_running_loop()
-            loop.create_task(_sheets_append_history_async(uid, "user", text))
-            loop.create_task(_sheets_append_history_async(uid, "assistant", deny))
-            loop.create_task(_sheets_append_metric_async(uid, "deny", "policy"))
+            loop.create_task(_sheets_append_history_async(uid, "user", comment_text))
+            loop.create_task(_sheets_append_history_async(uid, "assistant", ok_txt))
         except RuntimeError:
             pass
         return
 
-    # Paywall (если не в белом списке)
-    if (uid not in WHITELIST_USERS) and (not has_active_sub(u)):
+    # ---- Политика запрещённого контента
+    low = text.lower()
+    try:
+        if any(re.search(rx, low) for rx in ILLEGAL_PATTERNS):
+            deny = DENY_TEXT_UZ if u.get("lang","ru") == "uz" else DENY_TEXT_RU
+            await safe_answer(message, deny)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_sheets_append_history_async(uid, "user", text))
+                loop.create_task(_sheets_append_history_async(uid, "assistant", deny))
+                loop.create_task(_sheets_append_metric_async(uid, "deny", "policy"))
+            except RuntimeError:
+                pass
+            return
+    except Exception:
+        # если ILLEGAL_PATTERNS что-то странное — просто пропускаем
+        pass
+
+    # ---- Paywall (если не в белом списке и нет подписки)
+    try:
+        in_whitelist = (uid in WHITELIST_USERS)
+    except Exception:
+        in_whitelist = False
+
+    if (not in_whitelist) and (not has_active_sub(u)):
         txt = "💳 Бесплатный период закончился. Подключите ⭐ Creative, чтобы продолжить:"
         await safe_answer(message, txt, reply_markup=pay_kb())
         try:
@@ -1219,7 +1294,7 @@ def _smalltalk_reply(lang: str) -> str:
             pass
         return
 
-    # Запишем идентификацию + историю/метрики
+    # ---- Обновим карточку пользователя + историю/метрики
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_sheets_update_user_row_async(
@@ -1237,15 +1312,14 @@ def _smalltalk_reply(lang: str) -> str:
     except RuntimeError:
         pass
 
-    # Роутинг по режимам
+    # ---- Роутинг по режимам
     cur_mode = get_mode(uid)
-
-    # Очередь + ACK
-    topic_hint = TOPICS.get(u.get("topic"), {}).get("hint")
+    topic_hint = globals().get("TOPICS", {}).get(u.get("topic"), {}).get("hint")
+    FORCE_LIVE = globals().get("FORCE_LIVE", False)
     use_live = (cur_mode == "legal") or FORCE_LIVE or is_time_sensitive(text)
 
+    # ---- LEGAL режим (без очереди)
     if cur_mode == "legal":
-        # LEGAL ответ (без очереди)
         try:
             reply = await asyncio.wait_for(answer_legal(text, uid), timeout=REPLY_TIMEOUT_SEC)
             reply = strip_links_and_cleanup(reply, allow_links=True)
@@ -1254,9 +1328,12 @@ def _smalltalk_reply(lang: str) -> str:
         except Exception as e:
             logging.exception("legal reply fatal")
             reply = _friendly_error_text(e, u.get("lang","ru"))
+
         await safe_answer(message, reply)
-        stop_event = asyncio.Event()
-        bg_task = asyncio.create_task(typing_status_loop(message.chat.id, u.get("lang","ru"), stop_event))
+
+        # можно запустить фоновые «печатает…», если ожидается продолжение
+        # stop_event = asyncio.Event()
+        # asyncio.create_task(typing_status_loop(message.chat.id, u.get("lang","ru"), stop_event))
 
         append_history(uid, "assistant", reply)
         try:
@@ -1267,7 +1344,7 @@ def _smalltalk_reply(lang: str) -> str:
             pass
         return
 
-    # GPT режим — ставим задачу в очередь
+    # ---- GPT режим — поставить задачу в очередь
     task = SavolTask(
         chat_id=message.chat.id,
         uid=uid,
@@ -1291,54 +1368,9 @@ def _smalltalk_reply(lang: str) -> str:
     await safe_answer(message, ack)
     append_history(uid, "assistant", ack)
     try:
-        asyncio.get_running_loop().create_task(_sheets_append_history_async(uid, "assistant", ack))
+        loop = asyncio.get_running_loop()
+        loop.create_task(_sheets_append_history_async(uid, "assistant", ack))
     except RuntimeError:
-        pass
-
-from aiogram.enums import ChatAction
-
-async def _pulse_typing(chat_id: int, stop_event: asyncio.Event):
-    """Периодически шлём 'typing', пока не остановят."""
-    try:
-        while not stop_event.is_set():
-            if bot:
-                await bot.send_chat_action(chat_id, ChatAction.TYPING)
-            await asyncio.sleep(4.0)
-    except Exception:
-        pass
-
-async def typing_status_loop(chat_id: int, lang: str, stop: asyncio.Event):
-    """
-    Каждые ~4 сек шлёт ChatAction.TYPING.
-    На 6-й и 15-й секундах — мягкие статус-сообщения (не спамим чаще).
-    """
-    first_hint_sent = False
-    second_hint_sent = False
-    t0 = time.monotonic()
-    try:
-        while not stop.is_set():
-            # индикатор "печатает..."
-            if bot:
-                try:
-                    await bot.send_chat_action(chat_id, ChatAction.TYPING)
-                except Exception:
-                    pass
-
-            elapsed = time.monotonic() - t0
-            try:
-                if not first_hint_sent and elapsed > 6:
-                    txt = "…думаю и сверяю нормы на lex.uz" if lang != "uz" else "…o‘ylayapman va lex.uz bilan solishtiryapman"
-                    await bot.send_message(chat_id, txt)
-                    first_hint_sent = True
-                elif not second_hint_sent and elapsed > 15:
-                    txt = "…собираю подтверждения из первоисточников" if lang != "uz" else "…asosiy manbalardan tasdiqlarni yig‘ayapman"
-                    await bot.send_message(chat_id, txt)
-                    second_hint_sent = True
-            except Exception:
-                pass
-
-            await asyncio.sleep(4)
-    except asyncio.CancelledError:
         pass
 
 # ================== ОЧЕРЕДЬ/ВОРКЕРЫ =================
