@@ -757,46 +757,100 @@ def _format_lex_results(data: dict, limit: int = 5) -> list[dict]:
         })
     return items
 
-async def answer_legal(user_text: str, user_id: int) -> str:
-    data = await legal_search_lex(user_text, max_results=6)
-    sources = _format_lex_results(data or {}, limit=5) if data else []
-    if not sources:
-        return ("Не нашёл подтверждённой нормы на lex.uz по вашему вопросу. "
-                "Уточните формулировку (закон/сфера) или обратитесь к юристу.")
-    brief = []
-    for s in sources:
-        t = (s["title"] or "")[:120]
-        sn = (s["snippet"] or "")[:600]
-        brief.append(f"- {t}\n{sn}\n{s['url']}")
-    user_aug = f"ВОПРОС:\n{user_text}\n\nНАЙДЕННЫЕ ДОКУМЕНТЫ (lex.uz):\n" + "\n\n".join(brief)
-    import re as _re_check
-
 def _legal_answer_has_citations(ans: str) -> bool:
+    """
+    Быстрая проверка, что в тексте есть ссылка на lex.uz и указание статьи/пункта.
+    Допускаем рус/узб варианты.
+    """
     if not ans:
         return False
     has_link = "lex.uz" in ans
-    # грубая, но практичная проверка на "статья/модда/пункт/band"
-    has_article = bool(_re_check.search(r"(стат(ья|и)|модда|пункт|band)\s*\d+", ans, flags=_re_check.IGNORECASE))
+    has_article = bool(_re.search(r"(стат(ья|и)|modda|модда|пункт|band)\s*\d+", ans, flags=_re.IGNORECASE))
     return has_link and has_article
 
+
+async def answer_legal(user_text: str, user_id: int) -> str:
+    # 1) Поиск только по lex.uz
+    data = await legal_search_lex(user_text, max_results=6)
+    sources = _format_lex_results(data or {}, limit=5) if data else []
+
+    if not sources:
+        return ("Не нашёл подтверждённой нормы на lex.uz по вашему вопросу. "
+                "Уточните формулировку (закон/сфера) или обратитесь к юристу.\n\n"
+                f"_Проверено: {_tz_tashkent_date()}_")
+
+    # 2) Краткий бриф из найденных документов
+    brief_lines = []
+    for s in sources:
+        t = (s.get("title") or "")[:120]
+        sn = (s.get("snippet") or "")[:600]
+        url = s.get("url") or ""
+        brief_lines.append(f"- {t}\n{sn}\n{url}")
+    brief = "\n\n".join(brief_lines)
+
+    # 3) Подготавливаем сообщение для модели
+    # Система просит строго указывать статьи/пункты и прямые ссылки lex.uz.
+    system_prompt = (
+        LEGAL_SYSTEM_PROMPT
+        + " ОБЯЗАТЕЛЬНО: укажи хотя бы одну конкретную статью/пункт и поставь прямую ссылку на lex.uz."
+        + " Если точной нормы нет — ответь ровно фразой: 'Норма не найдена'."
+    )
+    user_aug = (
+        f"ВОПРОС:\n{user_text}\n\n"
+        f"НАЙДЕННЫЕ ДОКУМЕНТЫ (lex.uz):\n{brief}"
+    )
+
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.1,
-        "messages": build_messages(user_id, LEGAL_SYSTEM_PROMPT, user_aug),
-    }
-    async def _do():
-        return await client_openai.post("/chat/completions", headers=headers, json=payload)
-    try:
+
+    async def _call_openai(msgs, temperature: float = 0.1):
+        payload = {"model": OPENAI_MODEL, "temperature": temperature, "messages": msgs}
+        async def _do():
+            return await client_openai.post("/chat/completions", headers=headers, json=payload)
         async with _model_sem:
             r = await _retry(lambda: _do(), attempts=3)
         r.raise_for_status()
-        text = r.json()["choices"][0]["message"]["content"].strip()
-        return strip_links_and_cleanup(_sanitize_cutoff(text), allow_links=True)
+        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+    try:
+        # Первый заход
+        msgs = build_messages(user_id, system_prompt, user_aug)
+        raw = await _call_openai(msgs, temperature=0.1)
+        ans = strip_links_and_cleanup(_sanitize_cutoff(raw), allow_links=True)
+
+        # Если модель не вставила корректные ссылки/статьи — второй строгий заход
+        if not _legal_answer_has_citations(ans):
+            system_prompt_strict = (
+                LEGAL_SYSTEM_PROMPT
+                + " ВСТАВЬ МИНИМУМ ОДНУ ССЫЛКУ на lex.uz и УКАЗАНИЕ статьи/пункта."
+                + " Если по сводке нельзя сослаться на конкретную норму — ответь ровно: 'Норма не найдена'."
+            )
+            msgs2 = build_messages(user_id, system_prompt_strict, user_aug)
+            raw2 = await _call_openai(msgs2, temperature=0.05)
+            ans2 = strip_links_and_cleanup(_sanitize_cutoff(raw2), allow_links=True)
+            ans = ans2
+
+        # Если всё ещё нет корректных ссылок/статей — честный отказ
+        if not _legal_answer_has_citations(ans) or "Норма не найдена" in ans:
+            return ("Не нашёл подтверждённой нормы на lex.uz по вашему вопросу. "
+                    "Уточните формулировку (название закона/кодекса, предмет регулирования) или обратитесь к юристу.\n\n"
+                    f"_Проверено: {_tz_tashkent_date()}_")
+
+        # Страховка: если блок «Источники» отсутствует — добавим из результатов
+        if "Источники" not in ans and "Manbalar" not in ans:
+            src_md = "\n".join([f"- [{s['title']}]({s['url']})" for s in sources if s.get("url")])
+            if src_md:
+                ans = ans.rstrip() + "\n\n**Источники:**\n" + src_md
+
+        # Добавим «Проверено: …», если отсутствует
+        if "_Проверено:" not in ans and "Tekshirildi:" not in ans:
+            ans = ans.rstrip() + f"\n\n_Проверено: {_tz_tashkent_date()}_"
+
+        return ans
+
     except Exception as e:
         logging.exception("answer_legal failed")
         u = USERS.get(user_id, {"lang": "ru"})
-        return _friendly_error_text(e, u.get("lang","ru"))
+        return _friendly_error_text(e, u.get("lang", "ru"))
 
 # ================== FEEDBACK / UI =================
 def feedback_kb():
