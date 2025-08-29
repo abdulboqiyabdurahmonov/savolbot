@@ -1141,22 +1141,21 @@ async def cmd_legal(message: Message):
 # ================== ТЕКСТ-ХЕНДЛЕР ==================
 @dp.message(F.text)
 async def handle_text(message: Message):
-    text = (message.text or "").strip()
     uid = message.from_user.id
     u = get_user(uid)
-    import re
+    text = (message.text or "").strip()
 
-# ---- Smalltalk (дружелюбные ответы)
-if _SMALLTALK_RX.search(text):
-    reply = _smalltalk_reply(u.get("lang", "ru"))
-    await safe_answer(message, reply, reply_markup=feedback_kb())
-    append_history(uid, "assistant", reply)
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
-    except RuntimeError:
-        pass
-    return
+    # ---- Smalltalk (дружелюбные ответы)
+    if _SMALLTALK_RX.search(text):
+        reply = _smalltalk_reply(u.get("lang", "ru"))
+        await safe_answer(message, reply, reply_markup=feedback_kb())
+        append_history(uid, "assistant", reply)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_sheets_append_history_async(uid, "assistant", reply))
+        except RuntimeError:
+            pass
+        return
 
 _SMALLTALK_RX = re.compile(r"^(привет|салам|салом|hi|hello|здравствуй|ассалому\s*алайкум)\b", re.I)
 
