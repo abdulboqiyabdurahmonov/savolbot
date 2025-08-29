@@ -23,6 +23,8 @@ from aiogram.types import Message, Update, InlineKeyboardMarkup, InlineKeyboardB
 import gspread
 from google.oauth2.service_account import Credentials
 
+app = FastAPI(lifespan=lifespan)
+
 # ================== LOGS ==================
 logging.basicConfig(
     level=logging.INFO,
