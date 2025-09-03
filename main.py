@@ -758,16 +758,11 @@ def _format_lex_results(data: dict, limit: int = 5) -> list[dict]:
     return items
 
 def _legal_answer_has_citations(ans: str) -> bool:
-    """
-    Быстрая проверка, что в тексте есть ссылка на lex.uz и указание статьи/пункта.
-    Допускаем рус/узб варианты.
-    """
     if not ans:
         return False
     has_link = "lex.uz" in ans
-    has_article = bool(_re.search(r"(стат(ья|и)|modda|модда|пункт|band)\s*\d+", ans, flags=_re.IGNORECASE))
+    has_article = bool(re.search(r"(стат(ья|и)|modda|модда|пункт|band)\s*\d+", ans, flags=re.IGNORECASE))
     return has_link and has_article
-
 
 async def answer_legal(user_text: str, user_id: int) -> str:
     # 1) Поиск только по lex.uz
@@ -881,6 +876,37 @@ async def safe_edit_text(msg, text: str, **kwargs):
         logging.warning("edit_text failed: %s", e)
     except Exception:
         logging.exception("edit_text fatal")
+
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
+from contextlib import suppress
+
+async def safe_send_text(chat_id: int, text: str, reply_to_message_id: int | None = None):
+    MAX = 4096
+    chunks = [text[i:i+MAX] for i in range(0, len(text), MAX)] or [text]
+    for i, part in enumerate(chunks):
+        for attempt in range(5):
+            try:
+                logging.info(f"[send] try chat={chat_id} len={len(part)} attempt={attempt+1}")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=part,
+                    reply_markup=feedback_kb() if i == len(chunks)-1 else None,
+                    reply_to_message_id=reply_to_message_id if i == 0 else None,
+                    disable_web_page_preview=True
+                )
+                logging.info(f"[send] ok chat={chat_id}")
+                break
+            except TelegramRetryAfter as e:
+                logging.warning(f"[send] FloodWait {e.retry_after}s")
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramBadRequest as e:
+                logging.error(f"[send] BadRequest: {e}")
+                with suppress(Exception):
+                    await bot.send_message(chat_id=chat_id, text=part, disable_web_page_preview=True)
+                break
+            except Exception as e:
+                logging.exception(f"[send] Unexpected: {e}")
+                await asyncio.sleep(1.0)
 
 async def safe_edit_reply_markup(msg, **kwargs):
     try:
@@ -1444,10 +1470,7 @@ async def _queue_worker(name: str):
             logging.exception("worker %s: task failed", name)
         finally:
             SAVOL_QUEUE.task_done()
-            stop_event.set()
-            bg_task.cancel()
-
-
+          
 # ================== LIFESPAN & APP =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1516,10 +1539,7 @@ async def lifespan(app: FastAPI):
                 await client_http.aclose()
         except Exception:
             pass
-            stop_event.set()
-            bg_task.cancel()
-
-
+        
 # === FastAPI app (ВАЖНО: на верхнем уровне) ===
 app = FastAPI(lifespan=lifespan)
 
